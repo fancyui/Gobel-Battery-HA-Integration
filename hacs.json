@@ -1,0 +1,5 @@
+{
+  "name": "Gobel Battery Monitor",
+  "homeassistant": "2023.1.0",
+  "render_readme": true
+}

@@ -37,6 +37,7 @@ class GobelBatteryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def __init__(self):
         """Initialize config flow."""
+        super().__init__()
         self.init_data = {}
 
     async def async_step_user(self, user_input=None):
