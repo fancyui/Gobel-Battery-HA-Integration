@@ -1,45 +1,69 @@
 ---
-description: 
+description: Native Home Assistant Integration for Gobel Power Battery BMS
 ---
 
-# Gobel Power Battery Home Assistant Add-on (JK BMS, Pace BMS, TDT BMS)
+# Gobel Power Battery Home Assistant Integration (JK BMS, Pace BMS, TDT BMS)
 
 [Deutsch](docs/de/README.md) | [简体中文](docs/zh-cn/README.md)
 
 > **Note**: Looking for the ioBroker version? Check out the [ioBroker Gobel BMS Monitor Adapter](https://github.com/fancyui/ioBroker.gobel-bms-monitor).
 
-The ultimate Home Assistant integration for smart energy storage monitoring. This add-on provides robust, real-time data logging and diagnostics for your LiFePO4 battery banks running Pace BMS, JK BMS, or TDT BMS hardware. 
+The ultimate Home Assistant custom integration for smart energy storage monitoring. This integration communicates directly with your LiFePO4 battery banks running Pace BMS, JK BMS, or TDT BMS hardware, registering them as native entities in Home Assistant.
 
-Seamlessly bridge your solar energy storage system (ESS) with your home automation network using standard protocols like MQTT to monitor battery health, individual cell voltages, state of charge (SoC), and system protections.
+Unlike the previous Add-on version, this integration **does not require an MQTT broker**. It sets up device and sensor entities directly inside Home Assistant, supporting multi-device setups (e.g. multiple battery banks with different IPs/serial ports) via the visual configuration UI.
+
+---
 
 ## Key Features & Capabilities:
-* **Multi-BMS Compatibility:** Native support for Pace BMS, JK BMS (55AA protocol), and TDT BMS.
-* **Versatile Connectivity Options:** Connect your hardware via RS232-USB, RS232-to-Ethernet, RS232-to-WiFi, RS485-to-Ethernet, or RS485-to-WiFi.
-* **Comprehensive Telemetry:** Tracks state of charge (SoC), state of health (SoH), total voltage, current, individual cell balancing, temperatures, warnings, and fault protections.
-* **One Connection for All (Master-Slave):** Simplify your wiring. Connect directly to the Master BMS to automatically discover and aggregate data from all parallel-connected slave battery packs.
-* **Plug-and-Play Home Assistant Setup:** Quickly deploy and generate automated dashboards for real-time energy tracking.
+* **Multi-BMS Compatibility:** Native support for Pace BMS (RS232/RS485/WiFi), JK BMS (55AA passive protocol), and TDT BMS (RS232).
+* **Versatile Connectivity Options:** Connect directly via RS232-USB, RS232-to-Ethernet, RS232-to-WiFi, RS485-to-Ethernet, or RS485-to-WiFi.
+* **Direct Integration (No MQTT Required):** Create native Home Assistant sensors and binary sensors directly for cell voltages, capacity, current, and faults.
+* **Dynamic Multi-Device & Grouping:** Group overall metrics (Total SOC, Total Voltage, Total Current, etc.) under an aggregate Device, and create child Devices for each physical parallel-connected slave battery pack (fully compatible with Master-Slave dial structures).
+* **Config Flow GUI Setup:** Easy setup via the HA "Devices & Services" menu. No YAML editing, command-line arguments, or manual configuration file creation required.
 
-## Documents & Tools
-<a href="https://www.gobelpower.com/introduction_f61.html">Gobel Power Battery Home Assistant Addon Manual</a>  
-<a href="https://www.gobelpower.com/ha_dashboard_ap46.html">Online Home Assistant Dashboard Generator</a>
+---
 
 ## Dashboard Example:
 
 ![image](https://www.gobelpower.com/images/github/dashboard-gobel-power-home-assistant-addon-1.webp)
 
+---
+
 ## Pace BMS Connection Instructions:
-- **RS232-WIFI/Ethernet modual or RS232-USB cable needed**
+- **RS232-WIFI/Ethernet module or RS232-USB cable needed**
 - **Connection Port**: Connect Home Assistant to the **RS232** or **WIFI** interface of the Pace BMS.
 - **Master BMS**: The connection must be made to the **Master BMS**.
-- **DIP Switch Settings**: Ensure the DIP switch (Dial) of master BMS is set to **1000**.
+- **DIP Switch Settings**: Ensure the DIP switch (Dial) of the master BMS is set to **1000**.
 
 ## JK BMS Connection Instructions:
-- **RS485-WIFI/Ethernet modual or RS485-USB cable needed**
+- **RS485-WIFI/Ethernet module or RS485-USB cable needed**
 - **Connection Port**: Connect Home Assistant to the **RS485B** or **RS485C** interface of the JK BMS.
 - **Master BMS**: The connection must be made to the **Master BMS**.
-- **DIP Switch Settings**: Ensure the DIP switch (Dial) of master BMS is set to **0000**.
+- **DIP Switch Settings**: Ensure the DIP switch (Dial) of the master BMS is set to **0000**.
+
+---
 
 ## Installation:
-Click the button to add the addon to Home Assistant
 
-<a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/fancyui/Gobel-Battery-HA-Addon" rel="nofollow"><img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled." data-canonical-src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" style="max-width: 100%;"></a>
+### Option 1: Via HACS (Recommended)
+1. Ensure [HACS (Home Assistant Community Store)](https://hacs.xyz/) is installed.
+2. Go to **HACS -> Integrations** in Home Assistant.
+3. Click the three dots in the top-right corner and select **Custom repositories**.
+4. Paste the URL of this repository: `https://github.com/fancyui/Gobel-Battery-HA-Integration`
+5. Select **Integration** as the Category and click **Add**.
+6. Find the **Gobel Battery Monitor** integration in HACS and click **Download**.
+7. Restart Home Assistant.
+
+### Option 2: Manual Installation
+1. Download the latest release or clone the repository.
+2. Copy the `custom_components/gobel_battery` directory into your Home Assistant `/config/custom_components/` folder.
+3. Restart Home Assistant.
+
+---
+
+## Configuration:
+1. In Home Assistant, go to **Settings -> Devices & Services**.
+2. Click **Add Integration** in the bottom-right corner.
+3. Search for **Gobel Battery Monitor** and click to set it up.
+4. Follow the configuration steps on-screen to choose your BMS type, connection method (Network vs. Serial), and input connection parameters.
+5. If you have multiple battery banks with different IPs/ports, simply click **Add Integration** again to configure additional instances.
