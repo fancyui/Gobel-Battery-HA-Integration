@@ -1,27 +1,29 @@
-# Gobel Power Battery Home Assistant Add-on (JK BMS, Pace BMS, TDT BMS)
+# Gobel Power Battery Home Assistant Integration (JK BMS, Pace BMS, TDT BMS)
 
 [English](../../README.md) | [简体中文](../zh-cn/README.md)
 
 > **Hinweis**: Suchen Sie nach der ioBroker-Version? Besuchen Sie den [ioBroker Gobel BMS Monitor Adapter](https://github.com/fancyui/ioBroker.gobel-bms-monitor).
 
-Die ultimative Home Assistant-Integration für die intelligente Überwachung von Energiespeichern. Dieses Add-on bietet eine robuste Echtzeit-Datenprotokollierung und -Diagnose für Ihre LiFePO4-Batteriebänke mit Pace BMS-, JK BMS- oder TDT BMS-Hardware.
+Die ultimative Home Assistant-Integration für die intelligente Überwachung von Energiespeichern. Diese benutzerdefinierte Integration kommuniziert direkt mit Ihren LiFePO4-Batteriebänken mit Pace BMS-, JK BMS- oder TDT BMS-Hardware und registriert sie als native Entitäten in Home Assistant.
 
-Verbinden Sie Ihr Solarenergiespeichersystem (ESS) nahtlos mit Ihrem Heimautomatisierungsnetzwerk über Standardprotokolle wie MQTT, um den Batteriezustand, die einzelnen Zellspannungen, den Ladezustand (SoC) und Systemschutzfunktionen zu überwachen.
+Im Gegensatz zur vorherigen Add-on-Version **benötigt diese Integration keinen MQTT-Broker**. Sie erstellt Geräte- und Sensorentitäten direkt in Home Assistant und unterstützt über die visuelle Benutzeroberfläche Konfigurationen mit mehreren Geräten (z. B. Überwachung mehrerer Batteriebänke mit unterschiedlichen IPs/seriellen Anschlüssen).
+
+---
 
 ## Hauptmerkmale & Funktionen:
-* **Multi-BMS-Kompatibilität:** Native Unterstützung für Pace BMS, JK BMS (55AA-Protokoll) und TDT BMS.
+* **Multi-BMS-Kompatibilität:** Native Unterstützung für Pace BMS (RS232/RS485/WiFi), JK BMS (55AA-Passivprotokoll) und TDT BMS (RS232).
 * **Vielseitige Konnektivitätsoptionen:** Verbinden Sie Ihre Hardware über RS232-USB, RS232-zu-Ethernet, RS232-zu-WiFi, RS485-zu-Ethernet oder RS485-zu-WiFi.
-* **Umfassende Telemetrie:** Verfolgt Ladezustand (SoC), Batteriezustand (SoH), Gesamtspannung, Strom, individuellen Zellenausgleich, Temperaturen, Warnungen und Fehlerschutzfunktionen.
-* **Eine Verbindung für alle (Master-Slave):** Vereinfachen Sie Ihre Verkabelung. Verbinden Sie sich direkt mit dem Master-BMS, um automatisch alle parallel geschalteten Slave-Batteriepacks zu erkennen und deren Daten zu aggregieren.
-* **Plug-and-Play Home Assistant-Einrichtung:** Schnelle Bereitstellung und automatische Generierung von Dashboards für die Echtzeit-Energieüberwachung.
+* **Direkte Integration (kein MQTT erforderlich):** Erstellt native Home Assistant-Sensoren und Binärsensoren direkt für Zellspannungen, Kapazität, Strom, Temperaturen und Fehlermeldungen.
+* **Dynamische Gerätegruppierung:** Gruppiert Gesamtmetriken (Gesamt-SOC, Gesamtspannung, Gesamtstrom, Gesamtleistung) unter einem übergeordneten Gerät und erstellt untergeordnete Geräte für jedes physische, parallel geschaltete Slave-Batteriepack.
+* **Config Flow GUI Einrichtung:** Einfache Einrichtung über das Menü „Geräte & Dienste“ in HA. Es sind keine YAML-Änderungen, Befehlszeilen oder manuellen Konfigurationsdateien erforderlich.
 
-## Dokumente & Werkzeuge
-<a href="https://www.gobelpower.com/introduction_f61.html">Gobel Power Battery Home Assistant Addon Handbuch</a>  
-<a href="https://www.gobelpower.com/ha_dashboard_ap46.html">Online Home Assistant Dashboard Generator</a>
+---
 
 ## Dashboard-Beispiel:
 
 ![image](https://www.gobelpower.com/images/github/dashboard-gobel-power-home-assistant-addon-1.webp)
+
+---
 
 ## Anschlussanleitung für Pace BMS:
 - **RS232-WIFI/Ethernet-Modul oder RS232-USB-Kabel erforderlich**
@@ -35,7 +37,29 @@ Verbinden Sie Ihr Solarenergiespeichersystem (ESS) nahtlos mit Ihrem Heimautomat
 - **Master-BMS**: Die Verbindung muss mit dem **Master-BMS** hergestellt werden.
 - **DIP-Schalter-Einstellungen**: Stellen Sie sicher, dass die DIP-Schalter (Wahlschalter) des Master-BMS auf **0000** eingestellt sind.
 
-## Installation:
-Klicken Sie auf die Schaltfläche, um das Add-on zu Home Assistant hinzuzufügen
+---
 
-<a href="https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https://github.com/fancyui/Gobel-Battery-HA-Addon" rel="nofollow"><img src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" alt="Öffnen Sie Ihre Home Assistant-Instanz und zeigen Sie den Dialog zum Hinzufügen von Add-on-Repositories mit einer vorab ausgefüllten Repository-URL an." data-canonical-src="https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg" style="max-width: 100%;"></a>
+## Installation:
+
+### Option 1: Über HACS (empfohlen)
+1. Stellen Sie sicher, dass [HACS (Home Assistant Community Store)](https://hacs.xyz/) installiert ist.
+2. Gehen Sie in Home Assistant auf **HACS -> Integrationen**.
+3. Klicken Sie auf die drei Punkte in der oberen rechten Ecke und wählen Sie **Benutzerdefinierte Repositories**.
+4. Fügen Sie die URL dieses Repositories ein: `https://github.com/fancyui/Gobel-Battery-HA-Integration`
+5. Wählen Sie **Integration** als Kategorie aus und klicken Sie auf **Hinzufügen**.
+6. Suchen Sie nach der Integration **Gobel Battery Monitor** in HACS und klicken Sie auf **Herunterladen**.
+7. Starten Sie Home Assistant neu.
+
+### Option 2: Manuelle Installation
+1. Laden Sie die neueste Version (Zip-Datei) herunter.
+2. Kopieren Sie das Verzeichnis `custom_components/gobel_battery` in das Verzeichnis `/config/custom_components/` Ihres Home Assistant.
+3. Starten Sie Home Assistant neu.
+
+---
+
+## Konfiguration:
+1. Gehen Sie in Home Assistant auf **Einstellungen -> Geräte & Dienste**.
+2. Klicken Sie unten rechts auf **Integration hinzufügen**.
+3. Suchen Sie nach **Gobel Battery Monitor** und klicken Sie darauf.
+4. Folgen Sie den Schritten auf dem Bildschirm, um Ihren BMS-Typ und Ihre Verbindungsmethode auszuwählen, und geben Sie die Verbindungsparameter ein.
+5. Wenn Sie mehrere Batteriebänke mit unterschiedlichen IPs/Ports haben, klicken Sie einfach erneut auf **Integration hinzufügen**, um weitere Instanzen einzurichten.
