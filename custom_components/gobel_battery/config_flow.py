@@ -38,13 +38,13 @@ class GobelBatteryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self):
         """Initialize config flow."""
         super().__init__()
-        self.init_data = {}
+        self.config_data = {}
 
     async def async_step_user(self, user_input=None):
         """Handle the initial setup step."""
         errors = {}
         if user_input is not None:
-            self.init_data = user_input
+            self.config_data = user_input
             if user_input[CONF_CONNECTION_TYPE] in ["ethernet", "wifi"]:
                 return await self.async_step_network()
             else:
@@ -70,7 +70,7 @@ class GobelBatteryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle network configuration parameters (IP and port)."""
         errors = {}
         if user_input is not None:
-            user_data = {**self.init_data, **user_input}
+            user_data = {**self.config_data, **user_input}
             unique_id = f"{user_data[CONF_IP_ADDRESS]}_{user_data[CONF_IP_PORT]}"
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
@@ -92,7 +92,7 @@ class GobelBatteryConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle serial configuration parameters (Port and Baud rate)."""
         errors = {}
         if user_input is not None:
-            user_data = {**self.init_data, **user_input}
+            user_data = {**self.config_data, **user_input}
             unique_id = user_data[CONF_USB_PORT]
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
