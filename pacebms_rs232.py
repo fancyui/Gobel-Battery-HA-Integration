@@ -1,0 +1,1931 @@
+import struct
+import logging
+
+class PACEBMS232:
+
+    def __init__(self, bms_comm, ha_comm, bms_type, data_refresh_interval, debug, if_random):
+        self.bms_comm = bms_comm
+        self.ha_comm = ha_comm
+        self.bms_type = bms_type
+        self.data_refresh_interval = data_refresh_interval
+        self.if_random = if_random
+
+        # Configure logging
+        logging.basicConfig(level=logging.DEBUG if debug else logging.INFO,
+                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
+        
+        # 累积能量相关变量
+        import time
+        self.total_energy_charged = 0.0
+        self.total_energy_discharged = 0.0
+        self.last_energy_time = time.time()
+
+        # Salvage/cache states for out-of-order packets
+        self.cached_analog_data = None
+        self.cached_warning_data = None
+
+    def identify_packet_type(self, response):
+        """
+        Identify whether the received response is an analog packet or warning packet.
+        Returns 'analog', 'warning', or None if invalid.
+        """
+        if not response or not response.startswith('~'):
+            return None
+        
+        # Strip any trailing whitespace/carriage return
+        response = response.strip()
+        
+        # Check minimum length for header + checksum
+        if len(response) < 17:
+            return None
+            
+        try:
+            # Check command success (CID1 = 46, RTN = 00)
+            cid1 = response[5:7]
+            rtn = response[7:9]
+            if cid1 != '46' or rtn != '00':
+                return None
+                
+            # Extract LENID (3 characters starting at index 10)
+            lenid = int(response[10:13], 16)
+            
+            # Extract number of packs (2 characters starting at index 15)
+            num_packs = int(response[15:17], 16)
+            
+            if num_packs <= 0:
+                return None
+
+            # Remove SOI (~) and split into hex byte strings
+            stripped_resp = response[1:]
+            fields = [stripped_resp[i:i+2] for i in range(0, len(stripped_resp), 2)]
+            
+            if len(fields) < 10:
+                return None
+
+            # 1. Structural check: Does it fit the analog packet schema?
+            is_analog = False
+            for test_u in range(0, 100):
+                offset = 8
+                valid = True
+                for pack_index in range(num_packs):
+                    if offset >= len(fields) - 2:
+                        valid = False
+                        break
+                    try:
+                        num_cells = int(fields[offset], 16)
+                        offset += 1 + num_cells * 2
+                        if offset >= len(fields) - 2:
+                            valid = False
+                            break
+                        num_temps = int(fields[offset], 16)
+                        offset += 1 + num_temps * 2
+                        offset += 7  # Skip current(2), voltage(2), remain_cap(2), define_number_p(1)
+                        offset += test_u
+                    except (ValueError, IndexError):
+                        valid = False
+                        break
+                if valid and offset == len(fields) - 2:
+                    is_analog = True
+                    break
+
+            # 2. Structural check: Does it fit the warning packet schema?
+            is_warning = False
+            for test_w in range(10, 50):
+                offset = 8
+                valid = True
+                for pack_index in range(num_packs):
+                    if offset >= len(fields) - 2:
+                        valid = False
+                        break
+                    try:
+                        num_cells = int(fields[offset], 16)
+                        offset += 1 + num_cells
+                        if offset >= len(fields) - 2:
+                            valid = False
+                            break
+                        num_temps = int(fields[offset], 16)
+                        offset += 1 + num_temps
+                        offset += test_w
+                    except (ValueError, IndexError):
+                        valid = False
+                        break
+                if valid and offset == len(fields) - 2:
+                    is_warning = True
+                    break
+
+            if is_analog and not is_warning:
+                return 'analog'
+            elif is_warning and not is_analog:
+                return 'warning'
+            else:
+                # Fallback to ratiometric classification if both or neither match structurally
+                normalized_lenid = lenid * 2 if len(response) > 2 * lenid else lenid
+                ratio = normalized_lenid / num_packs
+                if ratio > 110:
+                    return 'analog'
+                else:
+                    return 'warning'
+        except Exception as e:
+            self.logger.error(f"Error identifying packet type: {e}")
+            return None
+
+    def process_incoming_response(self, response, expected_type):
+        """
+        Processes the received raw response.
+        If it matches expected_type, parses and returns it.
+        If it matches the OTHER type, parses it, caches it, and returns None.
+        If it matches neither, discards it (returns None).
+        """
+        packet_type = self.identify_packet_type(response)
+        if packet_type is None:
+            self.logger.warning(f"Received invalid or unidentifiable packet: {response[:30]}...")
+            return None
+            
+        if packet_type == expected_type:
+            if expected_type == 'analog':
+                return self.parse_analog_data(response)
+            else:
+                return self.parse_warning_data(response)
+        else:
+            self.logger.warning(f"Protocol Desync: Expected {expected_type} packet, but received {packet_type} packet. Salvaging...")
+            try:
+                if packet_type == 'analog':
+                    analog_data = self.parse_analog_data(response)
+                    if analog_data:
+                        self.cached_analog_data = analog_data
+                        self.logger.debug("Successfully salvaged and cached Analog data.")
+                else:
+                    warning_data = self.parse_warning_data(response)
+                    if warning_data:
+                        self.cached_warning_data = warning_data
+                        self.logger.debug("Successfully salvaged and cached Warning data.")
+            except Exception as e:
+                self.logger.error(f"Error parsing salvaged {packet_type} data: {e}")
+            
+            return None
+
+    def lchksum_calc(self, lenid):
+        try:
+            chksum = sum(int(chr(lenid[element]), 16) for element in range(len(lenid))) % 16
+            chksum_bin = '{0:04b}'.format(chksum)
+            flip_bits = ''.join('1' if b == '0' else '0' for b in chksum_bin)
+            chksum = (int(flip_bits, 2) + 1) % 16
+            return format(chksum, 'X')
+        except Exception as e:
+            self.logger.error(f"Error calculating LCHKSUM using LENID: {lenid}")
+            self.logger.error(f"Error details: {str(e)}")
+            return False
+    
+    def chksum_calc(self, data):
+        try:
+            chksum = sum(data[element] for element in range(1, len(data))) % 65536
+            chksum_bin = '{0:016b}'.format(chksum)
+            flip_bits = ''.join('1' if b == '0' else '0' for b in chksum_bin)
+            chksum = format(int(flip_bits, 2) + 1, 'X')
+            return chksum
+        except Exception as e:
+            self.logger.error(f"Error calculating CHKSUM using data: {data}")
+            self.logger.error(f"Error details: {str(e)}")
+            return False
+    
+    def hex_to_signed(self, hex_str):
+        """
+        Convert a 16-bit hexadecimal string to signed integer value.
+        
+        :param hex_str: Hexadecimal string representing battery current (e.g., "FFFB")
+        :return: Signed integer current value
+        """
+        # Convert the hexadecimal string to an integer
+        raw_value = int(hex_str, 16)
+        
+        # Process the 16-bit two's complement signed integer
+        if raw_value & 0x8000:  # Check the sign bit (if the highest bit is 1)
+            # Handle negative numbers: invert bits and add 1, then attach negative sign
+            signed_value = -((~raw_value & 0xFFFF) + 1)
+        else:
+            signed_value = raw_value
+        
+        
+        return signed_value
+
+    def calculate_cumulative_energy(self, power):
+        """
+        计算累积能量 (Wh)
+        
+        :param power: 当前功率 (kW)
+        :return: tuple(charged_energy, discharged_energy) - 累积充电和放电能量 (Wh)
+        """
+        import time
+        current_time = time.time()
+        time_diff = current_time - self.last_energy_time
+        
+        # 异常时间间隔检测（超过5分钟认为异常）
+        if time_diff > 300:
+            self.logger.warning(f"Abnormal time interval detected: {time_diff:.1f}s, resetting time base")
+            self.last_energy_time = current_time
+            return self.total_energy_charged, self.total_energy_discharged
+        
+        # 忽略过小的时间间隔（小于1秒）
+        if time_diff < 1:
+            return self.total_energy_charged, self.total_energy_discharged
+        
+        # 计算增量能量：功率(kW) × 时间(小时) × 1000 = Wh
+        energy_increment = abs(power) * time_diff / 3600 * 1000
+        
+        if power >= 0:
+            # 充电（正功率）
+            self.total_energy_charged += energy_increment
+            self.logger.debug(f"Charge increment: {energy_increment:.2f} Wh, Total charged: {self.total_energy_charged:.2f} Wh")
+        else:
+            # 放电（负功率）
+            self.total_energy_discharged += energy_increment
+            self.logger.debug(f"Discharge increment: {energy_increment:.2f} Wh, Total discharged: {self.total_energy_discharged:.2f} Wh")
+        
+        self.last_energy_time = current_time
+        return round(self.total_energy_charged, 2), round(self.total_energy_discharged, 2)
+
+    def reset_cumulative_energy(self):
+        """重置累积能量计数器"""
+        import time
+        self.total_energy_charged = 0.0
+        self.total_energy_discharged = 0.0
+        self.last_energy_time = time.time()
+        self.logger.info("Cumulative energy counters have been reset")
+
+    def generate_bms_request(self, command, pack_number=None):
+        commands_table = {
+            'pack_number': b"\x39\x30",
+            'analog': b"\x34\x32",
+            'software_version': b"\x43\x31",
+            'product_info': b"\x43\x32",
+            'capacity': b"\x41\x36",
+            'warning_info': b"\x34\x34",
+            'get_time': b"\x42\x31",
+            'pack_quantity': b"\x39\x30",
+        }
+        
+        lenids_table = {
+            'pack_number': b"000",
+            'analog': b"002",
+            'software_version': b"000",
+            'product_info': b"000",
+            'capacity': b"000",
+            'warning_info': b"002",
+            'get_time': b"000",
+            'pack_quantity': b"000",
+        }
+    
+        if command not in commands_table:
+            self.logger.error("Invalid command")
+            return None
+    
+        ver = b"\x32\x35"
+        cid1 = b"\x34\x36"
+        cid2 = commands_table[command]
+        
+        pack_number = pack_number if pack_number is not None else 255
+    
+        info = f"{pack_number:02X}".encode('ascii')
+
+        adr = b"00"  # ADR should be fixed "00", pack_number goes in INFO only
+        
+        request = b'\x7e' + ver + adr + cid1 + cid2
+        
+        LENID =  lenids_table[command]
+        
+        LCHKSUM = self.lchksum_calc(LENID)
+    
+        if LCHKSUM is False:
+            return None
+    
+        if LENID == b"000":
+            request += LCHKSUM.encode('ascii') + LENID
+        else:
+            request += LCHKSUM.encode('ascii') + LENID + info
+        
+        CHKSUM = self.chksum_calc(request)
+        if CHKSUM is False:
+            return None
+    
+        request += CHKSUM.encode('ascii') + b'\x0d'
+    
+        return request
+    
+    
+    
+    
+    
+    def generate_mosfet_control_request(self, command_type, state):
+        """
+        Generates a request to send to the BMS to control MOSFET states.
+        
+        Parameters:
+        command_type (str): The type of MOSFET control command to send to the BMS.
+                            It can be one of the following:
+                            - 'charge' for controlling charge MOSFET.
+                            - 'discharge' for controlling discharge MOSFET.
+        state (int): The state to set for the MOSFET (0 to open, 1 to close).
+        
+        Returns:
+        bytes: The request message to be sent to the BMS.
+        """
+        
+        SOI = 0x7E
+        VER = 0x32
+        ADR = 0x35
+        EOI = 0x0D
+        
+        commands = {
+            'charge': (0x46, 0x9A, 0x02),
+            'discharge': (0x46, 0x9B, 0x02)
+        }
+        
+        if command_type not in commands:
+            self.logger.error("Invalid command type")
+            return None
+        
+        if state not in [0, 1]:
+            self.logger.error("Invalid state. Must be 0 (open) or 1 (close)")
+            return None
+        
+        CID1, CID2, length = commands[command_type]
+        data_info = struct.pack('B', state)
+        
+        len_id = struct.pack('B', length)
+        data = struct.pack('BBBBBB', SOI, VER, ADR, CID1, CID2, length) + data_info + struct.pack('BB', EOI)
+        chk_sum = calculate_checksum(data)
+        
+        request = data[:-1] + struct.pack('B', chk_sum) + data[-1:]
+        return request
+    
+    
+    
+    
+    
+    
+    
+    def parse_analog_data(self, response):
+
+        if self.bms_type == "PACE_LV_V1":
+            packs_data = self.parse_analog_data_v1(response)
+        else:
+            packs_data = self.parse_analog_data_v2(response)
+
+        self.logger.debug(f"analog data parsed: {packs_data}")
+        return packs_data
+
+    def parse_analog_data_v1(self, response):
+        """
+        Parses the ASCII response string to extract pack analog data for multiple packs.
+    
+        Args:
+        response (str): The ASCII response string from the BMS.
+    
+        Returns:
+        list: Parsed data containing pack analog information for each pack.
+        """
+        packs_data = []
+    
+        # Ignore the first character if it is '~'
+        if response[0] == '~':
+            response = response[1:]
+    
+        # Split the response into fields (assuming each field is 2 characters representing a byte)
+        fields = [response[i:i + 2] for i in range(0, len(response), 2)]
+    
+        # Debug: Print the fields to verify their contents
+        self.logger.debug(f"fields: {fields}")
+        # Check the command and response validity
+        if fields[2] != '46' or fields[3] != '00':
+            self.logger.error(f"Invalid command or response code: {fields[2]} {fields[3]}")
+            return None
+    
+        # Extract the length of the data information
+        length = int(fields[4] + fields[5], 16)
+    
+        # Start parsing the data information
+        offset = 6  # Start after fixed header fields
+    
+        # INFOFLAG
+        infoflag = int(fields[offset], 16)
+        offset += 1
+    
+        # Number of packs
+        num_packs = int(fields[offset], 16)
+        offset += 1
+    
+        for pack_index in range(num_packs):
+            pack_data = {}
+    
+            # Number of cells
+            num_cells = int(fields[offset], 16)
+            offset += 1
+            pack_data['view_num_cells'] = num_cells
+    
+            # Cell voltages
+            cell_voltages = []
+            for cell_index in range(num_cells):
+                voltage = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for voltage
+                cell_voltages.append(voltage)
+                offset += 2
+            pack_data['cell_voltages'] = cell_voltages
+
+            cell_voltage_max = max(cell_voltages)
+            cell_voltage_min = min(cell_voltages)
+            cell_voltage_max_index = cell_voltages.index(cell_voltage_max) + 1
+            cell_voltage_min_index = cell_voltages.index(cell_voltage_min) + 1
+
+            pack_data['cell_voltage_max'] = cell_voltage_max
+            pack_data['cell_voltage_min'] = cell_voltage_min
+            pack_data['cell_voltage_max_index'] = cell_voltage_max_index
+            pack_data['cell_voltage_min_index'] = cell_voltage_min_index
+
+            pack_data['cell_voltage_diff'] = cell_voltage_max - cell_voltage_min
+    
+            # Number of temperature sensors
+            num_temps = int(fields[offset], 16)
+            offset += 1
+            pack_data['view_num_temps'] = num_temps
+    
+            # Temperatures
+            temperatures = []
+            for temp_index in range(num_temps):
+                temperature = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for temperature
+                temperature = round(temperature / 10 - 273.15, 2)  # Convert tenths of degrees Kelvin to degrees Celsius
+                temperatures.append(temperature)
+                offset += 2
+            pack_data['temperatures'] = temperatures
+    
+            # Pack current
+            pack_current = fields[offset] + fields[offset + 1]  # Combine two bytes for current
+            pack_current = self.hex_to_signed(pack_current) / 100
+
+            offset += 2
+            
+            pack_data['view_current'] = pack_current
+    
+            # Pack total voltage
+            pack_total_voltage = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for total voltage
+            pack_total_voltage = round(pack_total_voltage / 1000, 2)  # Convert mV to V
+            offset += 2
+            pack_data['view_voltage'] = pack_total_voltage
+
+            pack_power = round(pack_total_voltage * pack_current / 1000, 4) # Convert W to kW
+            pack_data['view_power'] = pack_power
+
+            # 使用累积能量计算
+            cumulative_charged, cumulative_discharged = self.calculate_cumulative_energy(pack_power)
+            pack_data['view_energy_charged'] = cumulative_charged
+            pack_data['view_energy_discharged'] = cumulative_discharged
+            # Pack remain capacity
+            pack_remain_capacity = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for remaining capacity
+            pack_remain_capacity = round(pack_remain_capacity / 100, 2)  # Convert 10mAH to AH
+            offset += 2
+            pack_data['view_remain_capacity'] = pack_remain_capacity
+    
+            # Define number P
+            define_number_p = int(fields[offset], 16)
+            offset += 1
+    
+            # Pack full capacity
+            pack_full_capacity = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for full capacity
+            pack_full_capacity = round(pack_full_capacity / 100, 2)  # Convert 10mAH to AH
+            offset += 2
+            pack_data['view_full_capacity'] = pack_full_capacity
+
+            pack_data['view_SOC'] = round(pack_remain_capacity / pack_full_capacity * 100, 1)
+    
+            # Cycle number
+            cycle_number = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for cycle number
+            offset += 2
+            pack_data['view_cycle_number'] = cycle_number
+    
+            # Pack design capacity
+            pack_design_capacity = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for design capacity
+            pack_design_capacity = round(pack_design_capacity / 100, 2)  # Convert 10mAH to AH
+            offset += 2
+            pack_data['view_design_capacity'] = pack_design_capacity
+
+            pack_data['view_SOH'] = round(pack_full_capacity / pack_design_capacity * 100, 0)
+    
+            packs_data.append(pack_data)
+    
+        return packs_data
+
+
+    def parse_analog_data_v2(self, response):
+        """
+        Parses the ASCII response string to extract pack analog data for multiple packs.
+    
+        Args:
+        response (str): The ASCII response string from the BMS.
+    
+        Returns:
+        list: Parsed data containing pack analog information for each pack.
+        """
+        packs_data = []
+    
+        # Ignore the first character if it is '~'
+        if response[0] == '~':
+            response = response[1:]
+ 
+        # Split the response into fields (assuming each field is 2 characters representing a byte)
+        fields = [response[i:i + 2] for i in range(0, len(response), 2)]
+    
+        # Debug: Print the fields to verify their contents
+        self.logger.debug(f"fields: {fields}")
+        # Check the command and response validity
+        if fields[2] != '46' or fields[3] != '00':
+            self.logger.error(f"Invalid command or response code: {fields[2]} {fields[3]}")
+            return None
+    
+        # Extract the length of the data information
+        length = int(fields[4] + fields[5], 16)
+    
+        # Start parsing the data information
+        offset = 6  # Start after fixed header fields
+    
+        # INFOFLAG
+        infoflag = int(fields[offset], 16)
+        offset += 1
+    
+        # Number of packs
+        num_packs = int(fields[offset], 16)
+        offset += 1
+    
+        if num_packs <= 0:
+            return []
+
+        # Dynamically calculate the number of user-defined bytes (U) per pack
+        found_u = None
+        for test_u in range(0, 100):
+            test_offset = offset
+            valid = True
+            for pack_index in range(num_packs):
+                if test_offset >= len(fields) - 2:
+                    valid = False
+                    break
+                num_cells = int(fields[test_offset], 16)
+                test_offset += 1 + num_cells * 2
+                if test_offset >= len(fields) - 2:
+                    valid = False
+                    break
+                num_temps = int(fields[test_offset], 16)
+                test_offset += 1 + num_temps * 2
+                # Skip current (2), total voltage (2), remaining capacity (2), define_number_p (1) -> 7 fields
+                test_offset += 7
+                # Skip test_u user-defined fields
+                test_offset += test_u
+            
+            # After parsing all packs, the test_offset should land exactly at len(fields) - 2
+            if valid and test_offset == len(fields) - 2:
+                found_u = test_u
+                break
+
+        if found_u is None:
+            self.logger.error("Failed to dynamically determine user-defined fields size! Defaulting to 20.")
+            found_u = 20
+
+        self.logger.debug(f"Dynamically determined user-defined bytes U = {found_u}")
+
+        for pack_index in range(num_packs):
+            pack_data = {}
+    
+            # Number of cells
+            num_cells = int(fields[offset], 16)
+            offset += 1
+            pack_data['view_num_cells'] = num_cells
+    
+            # Cell voltages
+            cell_voltages = []
+            for cell_index in range(num_cells):
+                voltage = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for voltage
+                cell_voltages.append(voltage)
+                offset += 2
+            pack_data['cell_voltages'] = cell_voltages
+ 
+            cell_voltage_max = max(cell_voltages)
+            cell_voltage_min = min(cell_voltages)
+            cell_voltage_max_index = cell_voltages.index(cell_voltage_max) + 1
+            cell_voltage_min_index = cell_voltages.index(cell_voltage_min) + 1
+ 
+            pack_data['cell_voltage_max'] = cell_voltage_max
+            pack_data['cell_voltage_min'] = cell_voltage_min
+            pack_data['cell_voltage_max_index'] = cell_voltage_max_index
+            pack_data['cell_voltage_min_index'] = cell_voltage_min_index
+ 
+            pack_data['cell_voltage_diff'] = cell_voltage_max - cell_voltage_min
+    
+            # Number of temperature sensors
+            num_temps = int(fields[offset], 16)
+            offset += 1
+            pack_data['view_num_temps'] = num_temps
+ 
+            # Temperatures
+            temperatures = []
+            for temp_index in range(num_temps):
+                temperature = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for temperature
+                temperature = round(temperature / 10 - 273.15, 2)  # Convert tenths of degrees Kelvin to degrees Celsius
+                temperatures.append(temperature)
+                offset += 2
+            pack_data['temperatures'] = temperatures
+    
+            # Pack current
+            pack_current = fields[offset] + fields[offset + 1]  # Combine two bytes for current
+            pack_current = self.hex_to_signed(pack_current) / 100
+ 
+            offset += 2
+            
+            pack_data['view_current'] = pack_current
+    
+            # Pack total voltage
+            pack_total_voltage = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for total voltage
+            pack_total_voltage = round(pack_total_voltage / 1000, 2)  # Convert mV to V
+            offset += 2
+            pack_data['view_voltage'] = pack_total_voltage
+ 
+            pack_power = round(pack_total_voltage * pack_current / 1000, 4) # Convert W to kW
+            pack_data['view_power'] = pack_power
+ 
+            # 使用累积能量计算
+            cumulative_charged, cumulative_discharged = self.calculate_cumulative_energy(pack_power)
+            pack_data['view_energy_charged'] = cumulative_charged
+            pack_data['view_energy_discharged'] = cumulative_discharged
+            # Pack remain capacity
+            pack_remain_capacity = int(fields[offset] + fields[offset + 1], 16)  # Combine two bytes for remaining capacity
+            pack_remain_capacity = round(pack_remain_capacity / 100, 2)  # Convert 10mAH to AH
+            offset += 2
+            pack_data['view_remain_capacity'] = pack_remain_capacity
+    
+            # Define number P
+            define_number_p = int(fields[offset], 16)
+            offset += 1
+            pack_data['define_number_p'] = define_number_p
+    
+            # Parse user-defined items based on found_u
+            u_offset = 0
+
+            # 1. Full Capacity (2 bytes)
+            if found_u - u_offset >= 2:
+                pack_full_capacity = int(fields[offset] + fields[offset + 1], 16)
+                pack_full_capacity_val = round(pack_full_capacity / 100, 2)
+                pack_data['view_full_capacity'] = pack_full_capacity_val
+                offset += 2
+                u_offset += 2
+            else:
+                pack_data['view_full_capacity'] = 0.0
+    
+            # 2. Cycle Count (2 bytes)
+            if found_u - u_offset >= 2:
+                cycle_number = int(fields[offset] + fields[offset + 1], 16)
+                pack_data['view_cycle_number'] = cycle_number
+                offset += 2
+                u_offset += 2
+
+            # 3. Design Capacity (2 bytes)
+            if found_u - u_offset >= 2:
+                pack_design_capacity = int(fields[offset] + fields[offset + 1], 16)
+                pack_design_capacity_val = round(pack_design_capacity / 100, 2)
+                pack_data['view_design_capacity'] = pack_design_capacity_val
+                offset += 2
+                u_offset += 2
+
+            # 4. SOC (1 byte)
+            if found_u - u_offset >= 1:
+                pack_soc = int(fields[offset], 16)
+                pack_data['view_SOC'] = round(float(pack_soc), 1)
+                offset += 1
+                u_offset += 1
+            else:
+                if pack_data.get('view_full_capacity', 0) > 0:
+                    pack_data['view_SOC'] = round(pack_remain_capacity / pack_data['view_full_capacity'] * 100, 1)
+                else:
+                    pack_data['view_SOC'] = 0.0
+
+            # 5. Cumulative Charge Capacity (4 bytes)
+            if found_u - u_offset >= 4:
+                offset += 4
+                u_offset += 4
+
+            # 6. Cumulative Discharge Capacity (4 bytes)
+            if found_u - u_offset >= 4:
+                offset += 4
+                u_offset += 4
+
+            # 7. SOH (1 byte)
+            if found_u - u_offset >= 1:
+                pack_soh = int(fields[offset], 16)
+                pack_data['view_SOH'] = round(float(pack_soh), 1)
+                offset += 1
+                u_offset += 1
+            else:
+                if pack_data.get('view_design_capacity', 0) > 0:
+                    pack_data['view_SOH'] = round(pack_data['view_full_capacity'] / pack_data['view_design_capacity'] * 100, 0)
+                else:
+                    pack_data['view_SOH'] = 100.0
+
+            # Skip any remaining user-defined fields
+            remaining_u = found_u - u_offset
+            if remaining_u > 0:
+                offset += remaining_u
+    
+            packs_data.append(pack_data)
+    
+        return packs_data
+
+    def extract_warnstate(self, data):
+        # Ensure the data starts with the SOI character (~)
+        if data[0] != '~':
+            self.logger.error("Data does not start with SOI (~)")
+            return None
+    
+        # Remove SOI (~)
+        data = data[1:]
+        
+        # Extract relevant positions
+        ver = data[0:2]
+        adr = data[2:4]
+        command = data[4:6]
+        rtn = data[6:8]
+        length_high_byte = data[8:10]
+        length_low_byte = data[10:12]
+
+        # Check the command and response validity
+        if command != '46' or rtn != '00':
+            self.logger.error(f"Invalid command or response code: {command} {rtn}")
+            return None
+        
+        # Calculate LENGTH in bytes
+        length = int(length_high_byte + length_low_byte, 16)
+        
+        # DATAINFO starts after LENGTH field (6th byte position)
+        data_start_position = 12
+        data_end_position = data_start_position + length * 2
+        
+        # Extract DATAINFO
+        datainfo = data[data_start_position:data_end_position]
+        
+        # Extract INFOFLAG and WARNSTATE from DATAINFO
+        INFOFLAG = datainfo[0:2]
+        WARNSTATE = datainfo[2:]  # Remaining part is WARNSTATE
+        
+        return INFOFLAG, WARNSTATE
+    
+    # Interpret function for warnings
+    def interpret_warning(self, value):
+        if value == 0x00:
+            return 'normal'
+        elif value == 0x01:
+            return 'below lower limit'
+        elif value == 0x02:
+            return 'above upper limit'
+        elif 0x80 <= value <= 0xEF:
+            return 'user defined'
+        elif value == 0xF0:
+            return 'other fault'
+        else:
+            return 'unknown'
+    
+    def parse_warnstate_V1(self, warnstate):
+        warnstate_bytes = bytes.fromhex(warnstate)
+        index = 0
+    
+        # Get PACKnumber
+        pack_number = warnstate_bytes[index]
+        index += 1
+    
+        packs_info = []
+    
+        for _ in range(pack_number):
+            pack_info = {}
+    
+            # Parse 1. Cell number
+            cell_number = warnstate_bytes[index]
+            pack_info['cell_number'] = cell_number
+            index += 1
+    
+            # Parse 2. Cell voltage warnings
+            cell_voltage_warnings = []
+            for _ in range(cell_number):
+                cell_voltage_warn = warnstate_bytes[index]
+                cell_voltage_warnings.append(self.interpret_warning(cell_voltage_warn))
+                index += 1
+            pack_info['cell_voltage_warnings'] = cell_voltage_warnings
+    
+            # Parse 3. Temperature sensor number
+            temp_sensor_number = warnstate_bytes[index]
+            pack_info['temp_sensor_number'] = temp_sensor_number
+            index += 1
+    
+            # Parse 4. Temperature sensor warnings
+            temp_sensor_warnings = []
+            for _ in range(temp_sensor_number):
+                temp_sensor_warn = warnstate_bytes[index]
+                temp_sensor_warnings.append(self.interpret_warning(temp_sensor_warn))
+                index += 1
+            pack_info['temp_sensor_warnings'] = temp_sensor_warnings
+    
+            # Parse 5. PACK charge current warning
+            pack_info['warn_charge_current'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Parse 6. PACK total voltage warning
+            pack_info['warn_total_voltage'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Parse 7. PACK discharge current warning
+            pack_info['warn_discharge_current'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Detailed interpretation for Protect State 1 based on Char A.19
+            protect_state_1 = warnstate_bytes[index]
+            pack_info['protect_state_1'] = {
+                'protect_short_circuit': bool(protect_state_1 & 0b01000000),
+                'protect_high_discharge_current': bool(protect_state_1 & 0b00100000),
+                'protect_high_charge_current': bool(protect_state_1 & 0b00010000),
+                'protect_low_total_voltage': bool(protect_state_1 & 0b00001000),
+                'protect_high_total_voltage': bool(protect_state_1 & 0b00000100),
+                'protect_low_cell_voltage': bool(protect_state_1 & 0b00000010),
+                'protect_high_cell_voltage': bool(protect_state_1 & 0b00000001),
+            }
+            index += 1
+    
+            # Detailed interpretation for Protect State 2 based on Char A.20
+            protect_state_2 = warnstate_bytes[index]
+            pack_info['protect_state_2'] = {
+                'status_fully_charged': bool(protect_state_2 & 0b10000000),
+                'protect_low_env_temp': bool(protect_state_2 & 0b01000000),
+                'protect_high_env_temp': bool(protect_state_2 & 0b00100000),
+                'protect_high_MOS_temp': bool(protect_state_2 & 0b00010000),
+                'protect_low_discharge_temp': bool(protect_state_2 & 0b00001000),
+                'protect_low_charge_temp': bool(protect_state_2 & 0b00000100),
+                'protect_high_discharge_temp': bool(protect_state_2 & 0b00000010),
+                'protect_high_charge_temp': bool(protect_state_2 & 0b00000001),
+            }
+            index += 1
+    
+            instruction_state = warnstate_bytes[index]
+            pack_info['instruction_state'] = {
+                'status_heating': bool(instruction_state & 0b10000000),
+                'status_charger_avaliable': bool(instruction_state & 0b00100000),
+                'status_reverse_connected': bool(instruction_state & 0b00010000),
+                'status_discharge_enabled': bool(instruction_state & 0b00000100),
+                'status_charge_enabled': bool(instruction_state & 0b00000010),
+                'status_current_limit_enabled': bool(instruction_state & 0b00000001),
+            }
+            index += 1
+            
+            control_state = warnstate_bytes[index]
+            pack_info['control_state'] = {
+                'led_warn_function': bool(control_state & 0b00100000),
+                'current_limit_function': bool(control_state & 0b00010000),
+                'current_limit_gear': bool(control_state & 0b00001000),
+                'buzzer_warn_function': bool(control_state & 0b00000001),
+            }
+            index += 1
+            
+            fault_state = warnstate_bytes[index]
+            pack_info['fault_state'] = {
+                'fault_sampling': bool(fault_state & 0b00100000),
+                'fault_cell': bool(fault_state & 0b00010000),
+                'fault_NTC': bool(fault_state & 0b00000100),
+                'fault_discharge_MOS': bool(fault_state & 0b00000010),
+                'fault_charge_MOS': bool(fault_state & 0b00000001),
+            }
+            index += 1
+            
+            # V1 doesn't support active balancing status, defaulting to 0
+            passive_bal_1 = warnstate_bytes[index]
+            index += 1
+            
+            passive_bal_2 = warnstate_bytes[index]
+            index += 1
+
+            pack_info['balancing_status_passive_1'] = passive_bal_1
+            pack_info['balancing_status_passive_2'] = passive_bal_2
+            pack_info['balancing_status_active_1'] = 0
+            pack_info['balancing_status_active_2'] = 0
+
+
+            # Detailed interpretation for Warn State 1 based on Char A.24
+            warn_state_1 = warnstate_bytes[index]
+            pack_info['warn_state_1'] = {
+                'warn_high_discharge_current': bool(warn_state_1 & 0b00100000),
+                'warn_high_charge_current': bool(warn_state_1 & 0b00010000),
+                'warn_low_total_voltage': bool(warn_state_1 & 0b00001000),
+                'warn_high_total_voltage': bool(warn_state_1 & 0b00000100),
+                'warn_low_cell_voltage': bool(warn_state_1 & 0b00000010),
+                'warn_high_cell_voltage': bool(warn_state_1 & 0b00000001),
+            }
+            index += 1
+    
+            # Detailed interpretation for Warn State 2 based on Char A.25
+            warn_state_2 = warnstate_bytes[index]
+            pack_info['warn_state_2'] = {
+                'warn_low_SOC': bool(warn_state_2 & 0b10000000),
+                'warn_high_MOS_temp': bool(warn_state_2 & 0b01000000),
+                'warn_low_env_temp': bool(warn_state_2 & 0b00100000),
+                'warn_high_env_temp': bool(warn_state_2 & 0b00010000),
+                'warn_low_discharge_temp': bool(warn_state_2 & 0b00001000),
+                'warn_low_charge_temp': bool(warn_state_2 & 0b00000100),
+                'warn_high_discharge_temp': bool(warn_state_2 & 0b00000010),
+                'warn_high_charge_temp': bool(warn_state_2 & 0b00000001),
+            }
+            index += 1
+    
+            packs_info.append(pack_info)
+    
+        return packs_info
+    
+
+    def parse_warnstate_V2(self, warnstate):
+        warnstate_bytes = bytes.fromhex(warnstate)
+        index = 0
+    
+        # Get PACKnumber
+        pack_number = warnstate_bytes[index]
+        index += 1
+    
+        packs_info = []
+    
+        # Dynamically determine the number of status bytes (W) per pack
+        found_w = None
+        for target_len in [len(warnstate_bytes) - 2, len(warnstate_bytes)]:
+            if target_len <= 1:
+                continue
+            for test_w in range(10, 50):
+                test_offset = index
+                valid = True
+                for pack_index in range(pack_number):
+                    if test_offset >= target_len:
+                        valid = False
+                        break
+                    num_cells = warnstate_bytes[test_offset]
+                    test_offset += 1 + num_cells
+                    if test_offset >= target_len:
+                        valid = False
+                        break
+                    num_temps = warnstate_bytes[test_offset]
+                    test_offset += 1 + num_temps
+                    # Skip test_w warning/status fields
+                    test_offset += test_w
+                
+                if valid and test_offset == target_len:
+                    found_w = test_w
+                    break
+            if found_w is not None:
+                break
+
+        if found_w is None:
+            self.logger.error("Failed to dynamically determine warning status bytes size! Defaulting to 17.")
+            found_w = 17
+        else:
+            self.logger.debug(f"Dynamically determined warning status bytes W = {found_w}")
+
+        for pack_index in range(pack_number):
+            pack_info = {}
+    
+            # Parse 1. Cell number
+            cell_number = warnstate_bytes[index]
+            pack_info['cell_number'] = cell_number
+            index += 1
+    
+            # Parse 2. Cell voltage warnings
+            cell_voltage_warnings = []
+            for _ in range(cell_number):
+                cell_voltage_warn = warnstate_bytes[index]
+                cell_voltage_warnings.append(self.interpret_warning(cell_voltage_warn))
+                index += 1
+            pack_info['cell_voltage_warnings'] = cell_voltage_warnings
+    
+            # Parse 3. Temperature sensor number
+            temp_sensor_number = warnstate_bytes[index]
+            pack_info['temp_sensor_number'] = temp_sensor_number
+            index += 1
+    
+            # Parse 4. Temperature sensor warnings
+            temp_sensor_warnings = []
+            for _ in range(temp_sensor_number):
+                temp_sensor_warn = warnstate_bytes[index]
+                temp_sensor_warnings.append(self.interpret_warning(temp_sensor_warn))
+                index += 1
+            pack_info['temp_sensor_warnings'] = temp_sensor_warnings
+    
+            # Parse 5. PACK charge current warning
+            pack_info['warn_charge_current'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Parse 6. PACK total voltage warning
+            pack_info['warn_total_voltage'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Parse 7. PACK discharge current warning
+            pack_info['warn_discharge_current'] = self.interpret_warning(warnstate_bytes[index])
+            index += 1
+    
+            # Detailed interpretation for Protect State 1 based on Char A.19
+            protect_state_1 = warnstate_bytes[index]
+            pack_info['protect_state_1'] = {
+                'protect_short_circuit': bool(protect_state_1 & 0b01000000),
+                'protect_high_discharge_current': bool(protect_state_1 & 0b00100000),
+                'protect_high_charge_current': bool(protect_state_1 & 0b00010000),
+                'protect_low_total_voltage': bool(protect_state_1 & 0b00001000),
+                'protect_high_total_voltage': bool(protect_state_1 & 0b00000100),
+                'protect_low_cell_voltage': bool(protect_state_1 & 0b00000010),
+                'protect_high_cell_voltage': bool(protect_state_1 & 0b00000001),
+            }
+            index += 1
+    
+            # Detailed interpretation for Protect State 2 based on Char A.20
+            protect_state_2 = warnstate_bytes[index]
+            pack_info['protect_state_2'] = {
+                'status_fully_charged': bool(protect_state_2 & 0b10000000),
+                'protect_low_env_temp': bool(protect_state_2 & 0b01000000),
+                'protect_high_env_temp': bool(protect_state_2 & 0b00100000),
+                'protect_high_MOS_temp': bool(protect_state_2 & 0b00010000),
+                'protect_low_discharge_temp': bool(protect_state_2 & 0b00001000),
+                'protect_low_charge_temp': bool(protect_state_2 & 0b00000100),
+                'protect_high_discharge_temp': bool(protect_state_2 & 0b00000010),
+                'protect_high_charge_temp': bool(protect_state_2 & 0b00000001),
+            }
+            index += 1
+    
+            instruction_state = warnstate_bytes[index]
+            pack_info['instruction_state'] = {
+                'status_heating': bool(instruction_state & 0b10000000),
+                'status_charger_avaliable': bool(instruction_state & 0b00100000),
+                'status_reverse_connected': bool(instruction_state & 0b00010000),
+                'status_discharge_enabled': bool(instruction_state & 0b00000100),
+                'status_charge_enabled': bool(instruction_state & 0b00000010),
+                'status_current_limit_enabled': bool(instruction_state & 0b00000001),
+            }
+            index += 1
+            
+            control_state = warnstate_bytes[index]
+            pack_info['control_state'] = {
+                'led_warn_function': bool(control_state & 0b00100000),
+                'current_limit_function': bool(control_state & 0b00010000),
+                'current_limit_gear': bool(control_state & 0b00001000),
+                'buzzer_warn_function': bool(control_state & 0b00000001),
+            }
+            index += 1
+            
+            fault_state = warnstate_bytes[index]
+            pack_info['fault_state'] = {
+                'fault_sampling': bool(fault_state & 0b00100000),
+                'fault_cell': bool(fault_state & 0b00010000),
+                'fault_NTC': bool(fault_state & 0b00000100),
+                'fault_discharge_MOS': bool(fault_state & 0b00000010),
+                'fault_charge_MOS': bool(fault_state & 0b00000001),
+            }
+            index += 1
+            
+            passive_bal_1 = warnstate_bytes[index]
+            index += 1
+            
+            passive_bal_2 = warnstate_bytes[index]
+            index += 1
+ 
+            # Detailed interpretation for Warn State 1 based on Char A.24
+            warn_state_1 = warnstate_bytes[index]
+            pack_info['warn_state_1'] = {
+                'warn_high_discharge_current': bool(warn_state_1 & 0b00100000),
+                'warn_high_charge_current': bool(warn_state_1 & 0b00010000),
+                'warn_low_total_voltage': bool(warn_state_1 & 0b00001000),
+                'warn_high_total_voltage': bool(warn_state_1 & 0b00000100),
+                'warn_low_cell_voltage': bool(warn_state_1 & 0b00000010),
+                'warn_high_cell_voltage': bool(warn_state_1 & 0b00000001),
+            }
+            index += 1
+    
+            # Detailed interpretation for Warn State 2 based on Char A.25
+            warn_state_2 = warnstate_bytes[index]
+            pack_info['warn_state_2'] = {
+                'warn_low_SOC': bool(warn_state_2 & 0b10000000),
+                'warn_high_MOS_temp': bool(warn_state_2 & 0b01000000),
+                'warn_low_env_temp': bool(warn_state_2 & 0b00100000),
+                'warn_high_env_temp': bool(warn_state_2 & 0b00010000),
+                'warn_low_discharge_temp': bool(warn_state_2 & 0b00001000),
+                'warn_low_charge_temp': bool(warn_state_2 & 0b00000100),
+                'warn_high_discharge_temp': bool(warn_state_2 & 0b00000010),
+                'warn_high_charge_temp': bool(warn_state_2 & 0b00000001),
+            }
+            index += 1
+            
+            # Parse active balancing status bytes from remaining bytes
+            remaining_w = found_w - 12
+            active_bal_1 = 0
+            active_bal_2 = 0
+            if remaining_w >= 3:
+                if index + 1 < len(warnstate_bytes):
+                    active_bal_1 = warnstate_bytes[index + 1]
+                if index + 2 < len(warnstate_bytes):
+                    active_bal_2 = warnstate_bytes[index + 2]
+            
+            def get_balancing_cell(bitmask, offset_cell):
+                if not bitmask:
+                    return 0
+                for i in range(8):
+                    if bitmask & (1 << i):
+                        return i + offset_cell
+                return 0
+
+            pack_info['balancing_status_passive_1'] = passive_bal_1
+            pack_info['balancing_status_passive_2'] = passive_bal_2
+            pack_info['balancing_status_active_1'] = get_balancing_cell(active_bal_1, 1)
+            pack_info['balancing_status_active_2'] = get_balancing_cell(active_bal_2, 9)
+
+            if remaining_w > 0:
+                index += remaining_w
+    
+            packs_info.append(pack_info)
+    
+        return packs_info
+
+
+
+
+    def parse_warning_data(self, data):
+
+        infoflag, warnstate = self.extract_warnstate(data)
+
+        if self.bms_type == "PACE_LV_V1":
+            packs_info = self.parse_warnstate_V1(warnstate)
+        else:
+            packs_info = self.parse_warnstate_V2(warnstate)
+    
+        packs_data = []
+        for pack in packs_info:
+            pack_data = {
+                'cell_number': pack['cell_number'],
+                'cell_voltage_warnings': pack['cell_voltage_warnings'],
+                'temp_sensor_number': pack['temp_sensor_number'],
+                'temp_sensor_warnings': pack['temp_sensor_warnings'],
+                'warn_charge_current': pack['warn_charge_current'],
+                'warn_total_voltage': pack['warn_total_voltage'],
+                'warn_discharge_current': pack['warn_discharge_current'],
+                'protect_state_1': pack['protect_state_1'],
+                'protect_state_2': pack['protect_state_2'],
+                'instruction_state': pack['instruction_state'],
+                'control_state': pack['control_state'],
+                'fault_state': pack['fault_state'],
+                'balancing_status_passive_1': pack['balancing_status_passive_1'],
+                'balancing_status_passive_2': pack['balancing_status_passive_2'],
+                'balancing_status_active_1': pack['balancing_status_active_1'],
+                'balancing_status_active_2': pack['balancing_status_active_2'],
+                'warn_state_1': pack['warn_state_1'],
+                'warn_state_2': pack['warn_state_2']
+            }
+            packs_data.append(pack_data)
+    
+        self.logger.debug(f"warning data parsed: {packs_data}")
+        return packs_data
+    
+    
+    
+    
+    
+    def parse_capacity_data(self, data):
+        """
+        Parses the capacity data received from the BMS.
+        
+        Parameters:
+        data (str): The raw data string received from the BMS.
+        
+        Returns:
+        dict: Parsed capacity information.
+        """
+        fields = data.split()
+        capacity_info = {
+            'remaining_capacity': int(fields[0], 16) / 100,  # Assuming the unit is in 0.01 Ah
+            'full_charge_capacity': int(fields[1], 16) / 100,  # Assuming the unit is in 0.01 Ah
+            'cycle_count': int(fields[2], 16)
+        }
+        return capacity_info
+    
+    
+    def parse_time_date_data(self, data):
+        """
+        Parses the time and date data received from the BMS.
+        
+        Parameters:
+        data (str): The raw data string received from the BMS.
+        
+        Returns:
+        dict: Parsed time and date information.
+        """
+        fields = data.split()
+        time_date_info = {
+            'year': int(fields[0], 16),
+            'month': int(fields[1], 16),
+            'day': int(fields[2], 16),
+            'hour': int(fields[3], 16),
+            'minute': int(fields[4], 16),
+            'second': int(fields[5], 16)
+        }
+        return time_date_info
+    
+    
+    def parse_pack_number_data(self, response):
+        # Remove the SOI character (~)
+        if response.startswith('~'):
+            response = response[1:]
+
+        # Extract fields based on the given response structure
+        ver = response[0:2]
+        adr = response[2:4]
+        fixed_hex = response[4:6]
+        rtn = response[6:8]
+        length = response[8:10]
+        lenid = response[10:12]
+
+        # Determine the length of DATAINFO
+        if lenid == '02':
+            data_info_length = 2  # 2 characters for address confirmation
+        else:
+            self.logger.error("Invalid LENID value")
+
+        data_info = response[12:14]
+
+        # RS232 protocol has no datainfo
+        address_value = int(adr, 16)
+
+        return address_value
+    
+    def parse_pack_quantity_data(self, response):
+        # Remove the SOI character (~)
+        if response.startswith('~'):
+            response = response[1:]
+
+        # Extract fields based on the given response structure
+        ver = response[0:2]
+        adr = response[2:4]
+        fixed_hex = response[4:6]
+        rtn = response[6:8]
+        length = response[8:10]
+        lenid = response[10:12]
+
+        # Determine the length of DATAINFO
+        if lenid == '02':
+            data_info_length = 2  # 2 characters for address confirmation
+        else:
+            self.logger.error("Invalid LENID value")
+
+        data_info = response[12:14]
+
+        # Convert DATAINFO from hex to integer
+        pack_quantity = int(data_info, 16)
+
+        return pack_quantity
+
+    def parse_software_version_data(self, response):
+        # Remove the SOI character (~)
+        if response.startswith('~'):
+            response = response[1:]
+
+        # Extract fields based on the given response structure
+        ver = response[0:2]
+        adr = response[2:4]
+        fixed_hex = response[4:6]
+        rtn = response[6:8]
+        length = response[8:10]
+        lenid = response[10:12]
+
+        # Determine the length of DATAINFO
+        if lenid == '28':
+            data_info_length = 20  # 20 characters for software version information
+        else:
+            self.logger.error("Invalid LENID value")
+
+        data_info = response[12:12 + data_info_length * 2]  # Each character is represented by 2 hex digits
+
+        # Convert DATAINFO from hex to ASCII
+        software_version_info = bytes.fromhex(data_info).decode('ascii')
+
+        return software_version_info
+    
+    
+    def parse_product_info_data(self, response):
+        # Remove the SOI character (~)
+        if response.startswith('~'):
+            response = response[1:]
+
+        # Extract fields based on the given response structure
+        ver = response[0:2]
+        adr = response[2:4]
+        fixed_hex = response[4:6]
+        rtn = response[6:8]
+        length = response[8:10]
+        lenid = response[10:12]
+
+        # Determine the length of DATAINFO
+        if lenid == '50':
+            data_info_length = 40  # 20 characters for BMS and 20 characters for PACK
+        elif lenid == '28':
+            data_info_length = 20  # 20 characters for BMS only
+        else:
+            self.logger.error("Invalid LENID value")
+            return None
+
+        data_info = response[12:12 + data_info_length * 2]  # Each character is represented by 2 hex digits
+
+        # Split DATAINFO into BMS and PACK production information
+        bms_info_hex = data_info[:40]  # 20 characters * 2 hex digits
+        bms_info = bytes.fromhex(bms_info_hex).decode('ascii')
+
+        if lenid == '50':
+            pack_info_hex = data_info[40:80]  # Next 20 characters * 2 hex digits
+            pack_info = bytes.fromhex(pack_info_hex).decode('ascii')
+        else:
+            pack_info = None
+
+        return bms_info, pack_info
+    
+    
+    
+    
+    def get_analog_data(self, pack_number=None):
+        try:
+            # Check cache first
+            if self.cached_analog_data is not None:
+                self.logger.debug("Returning Analog data from salvage cache.")
+                data = self.cached_analog_data
+                self.cached_analog_data = None
+                return data
+
+            # Generate request
+            self.logger.debug(f"Trying to prepare analog request")
+            request = self.generate_bms_request("analog", pack_number)
+            self.logger.debug(f"analog request: {request}")
+
+            # Send request to BMS
+            self.logger.debug(f"Trying to send analog request")
+            self.bms_comm.flush()
+            self.logger.debug(f"Raw Send: {request.decode('ascii', errors='ignore').strip()} (Hex: {request.hex().upper()})")
+            if not self.bms_comm.send_data(request):
+                return None
+            self.logger.debug(f"analog request sent")
+    
+            # Receive response from BMS
+            self.logger.debug(f"Trying to receive analog data")
+            response = self.bms_comm.receive_data()
+            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+            self.logger.debug(f"analog data recieved: {response}")
+            if response is None:
+                return None
+            
+            # Process and validate response
+            return self.process_incoming_response(response, 'analog')
+    
+        except Exception as e:
+            self.logger.error(f"An error occurred in get_analog_data: {e}")
+            return None
+    
+    
+    
+    def get_warning_data(self, pack_number=None):
+        try:
+            # Check cache first
+            if self.cached_warning_data is not None:
+                self.logger.debug("Returning Warning data from salvage cache.")
+                data = self.cached_warning_data
+                self.cached_warning_data = None
+                return data
+
+            # Generate request
+            self.logger.debug(f"Trying to prepare warning request")
+            request = self.generate_bms_request("warning_info", pack_number)
+            self.logger.debug(f"warning request: {request}")
+            
+            # Send request to BMS
+            self.logger.debug(f"Trying to send warning request")
+            self.bms_comm.flush()
+            self.logger.debug(f"Raw Send: {request.decode('ascii', errors='ignore').strip()} (Hex: {request.hex().upper()})")
+            if not self.bms_comm.send_data(request):
+                return None
+            self.logger.debug(f"warning request sent")
+            
+            # Receive response from BMS
+            self.logger.debug(f"Trying to receive warning data")
+            response = self.bms_comm.receive_data()
+            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+            self.logger.debug(f"warning data recieved: {response}")
+            if response is None:
+                return None
+            
+            # Process and validate response
+            return self.process_incoming_response(response, 'warning')
+    
+        except Exception as e:
+            self.logger.error(f"An error occurred in get_warning_data: {e}")
+            return None
+    
+    
+    
+    def get_capacity_data(self, pack_number=None):
+        
+        try:
+            # Generate request
+            self.logger.debug(f"Trying to prepare capacity request")
+            request = self.generate_bms_request("capacity",pack_number)
+            self.logger.debug(f"capacity request: {request}")
+
+            # Send request to BMS
+            self.logger.debug(f"Trying to send capacity request")
+            self.logger.debug(f"Raw Send: {request.decode('ascii', errors='ignore').strip()} (Hex: {request.hex().upper()})")
+            if not self.bms_comm.send_data(request):
+                return None
+            self.logger.debug(f"capacity request sent")
+    
+            # Receive response from BMS
+            self.logger.debug(f"Trying to receive capacity data")
+            response = self.bms_comm.receive_data()
+            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+            self.logger.debug(f"capacity data recieved: {response}")
+            if response is None:
+                return None
+            
+            # Parse analog data from response
+            self.logger.debug(f"Trying to parse capacity data")
+            capacity_data = self.parse_capacity_data(response)
+            self.logger.debug(f"capacity data parsed: {capacity_data}")
+            return capacity_data
+    
+        except Exception as e:
+            self.logger.error(f"An error occurred: {e}")
+            return None
+    
+    
+    
+    def get_product_info_data(self, pack_number=None):
+        
+        try:
+            # Generate request
+            self.logger.debug(f"Trying to prepare product info request")
+            request = self.generate_bms_request("product_info",pack_number)
+            self.logger.debug(f"product info request: {request}")
+
+            # Send request to BMS
+            self.logger.debug(f"Trying to send product info request")
+            self.logger.debug(f"Raw Send: {request.decode('ascii', errors='ignore').strip()} (Hex: {request.hex().upper()})")
+            if not self.bms_comm.send_data(request):
+                return None
+            self.logger.debug(f"product info request sent")
+    
+            # Receive response from BMS
+            self.logger.debug(f"Trying to receive product info data")
+            response = self.bms_comm.receive_data()
+            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+            self.logger.debug(f"product info data recieved: {response}")
+            if response is None:
+                return None
+            
+            # Parse analog data from response
+            self.logger.debug(f"Trying to parse product info data")
+            bms_info, pack_info =  self.parse_product_info_data(response)
+            self.logger.debug(f"product info data parsed: {bms_info}")
+            self.logger.debug(f"product info data parsed: {pack_info}")
+            return bms_info, pack_info
+    
+        except Exception as e:
+            self.logger.error(f"An error occurred: {e}")
+            return None
+
+    def get_pack_num_data(self, pack_number):
+        
+        
+        try:
+            # Generate request
+            self.logger.debug(f"Trying to prepare pack num request")
+            request = self.generate_bms_request("pack_number",pack_number)
+            self.logger.debug(f"pack num request: {request}")
+
+            # Send request to BMS
+            self.logger.debug(f"Trying to send pack num request")
+            self.bms_comm.flush()
+            self.logger.debug(f"Raw Send: {request.decode('ascii', errors='ignore').strip()} (Hex: {request.hex().upper()})")
+            if not self.bms_comm.send_data(request):
+                return None
+            self.logger.debug(f"pack num request sent")
+    
+            # Receive response from BMS
+            self.logger.debug(f"Trying to receive pack num data")
+            response = self.bms_comm.receive_data()
+            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+            self.logger.debug(f"pack num data recieved: {response}")
+            if response is None:
+                return None
+            
+            # Parse analog data from response
+            self.logger.debug(f"Trying to parse pack num data")
+            pack_number_data = self.parse_pack_number_data(response)
+            self.logger.debug(f"pack num data parsed: {pack_number_data}")
+            return pack_number_data
+    
+        except Exception as e:
+            self.logger.error(f"An error occurred: {e}")
+            return None
+
+    def check_if_pack_exsit(self, pack_number):
+        try:
+            pack_num_data = self.get_pack_num_data(pack_number)
+            if int(pack_num_data) == pack_number:
+                if_exsit = pack_number
+            else:
+                if_exsit = False
+
+        except Exception as e:
+            self.logger.error(f"An error occurred: {e}")
+            return None
+
+    def publish_analog_data_api(self, pack_number=None):
+
+        units = {
+            'num_cells': 'cells',
+            'cell_voltages': 'mV',
+            'num_temps': 'NTCs',
+            'temperatures': '°C',
+            'pack_current': 'A',
+            'pack_total_voltage': 'V',
+            'pack_remain_capacity': 'Ah',
+            'pack_full_capacity': 'Ah',
+            'cycle_number': 'cycles',
+            'pack_design_capacity': 'Ah',
+        }
+
+        analog_data = self.get_analog_data(pack_number)
+
+        total_packs_num = len(analog_data)
+
+        if total_packs_num < 1:
+            self.logger.error("No packs found")
+            return None
+
+        self.ha_comm.publish_data(total_packs_num, 'packs', f"{self.base_topic}.total_packs_num")
+
+        total_pack_full_capacity = round(sum(d.get('pack_full_capacity', 0) for d in analog_data),2)
+        self.ha_comm.publish_data(total_pack_full_capacity, 'Ah', f"{self.base_topic}.total_pack_full_capacity")
+
+        total_pack_remain_capacity = round(sum(d.get('pack_remain_capacity', 0) for d in analog_data),2)
+        self.ha_comm.publish_data(total_pack_remain_capacity, 'Ah', f"{self.base_topic}.total_pack_remain_capacity")
+
+        total_pack_current = round(sum(d.get('pack_current', 0) for d in analog_data),2)
+        self.ha_comm.publish_data(total_pack_current, 'A', f"{self.base_topic}.total_pack_current")
+
+        total_soc = round(total_pack_remain_capacity / total_pack_full_capacity * 100, 1) 
+        self.ha_comm.publish_data(total_soc, '%', f"{self.base_topic}.total_soc")
+
+        total_mean_voltage = round(sum(d.get('pack_total_voltage', 0) for d in analog_data) / total_packs_num, 2)
+        self.ha_comm.publish_data(total_mean_voltage, 'V', f"{self.base_topic}.total_mean_voltage")
+
+        total_power = round(sum(d.get('pack_full_capacity', 0) for d in analog_data),2)
+        self.ha_comm.publish_data(total_power, 'kW', f"{self.base_topic}.total_power")
+
+        import random
+        random_number = random.randint(1, 100)
+        self.ha_comm.publish_data(random_number, 'p', f"{self.base_topic}.random")
+
+        pack_i = 0
+
+        for pack in analog_data:
+            pack_i = pack_i + 1
+            for key, value in pack.items():
+                unit = units.get(key, '')
+                if key == 'cell_voltages':
+                    cell_i = 0
+                    for cell_voltage in value:
+                        cell_i = cell_i + 1
+                        self.ha_comm.publish_data(cell_voltage, unit, f"{self.base_topic}.pack_{pack_i:02}_cell_voltage_{cell_i:02}")
+                        
+                elif key == 'temperatures':
+                    temperature_i = 0
+                    for temperature in value:
+                        temperature_i = temperature_i + 1
+                        self.ha_comm.publish_data(temperature, unit, f"{self.base_topic}.pack_{pack_i:02}_temperature_{temperature_i:02}")
+                        
+                else:
+                    self.ha_comm.publish_data(value, unit, f"{self.base_topic}.pack_{pack_i:02}_{key}")
+
+
+    def publish_analog_data_mqtt(self, pack_number=None):
+
+        units = {
+            'view_num_cells': 'cells',
+            'cell_voltages': 'mV',
+            'cell_voltage_max': 'mV',
+            'cell_voltage_min': 'mV',
+            'cell_voltage_max_index': '',
+            'cell_voltage_min_index': '',
+            'cell_voltage_diff': 'mV',
+            'view_num_temps': 'NTCs',
+            'temperatures': '°C',
+            'view_current': 'A',
+            'view_voltage': 'V',
+            'view_remain_capacity': 'Ah',
+            'view_full_capacity': 'Ah',
+            'view_cycle_number': 'cycles',
+            'view_design_capacity': 'Ah',
+            'view_power': 'kW',
+            'view_energy_charged': 'Wh',
+            'view_energy_discharged': 'Wh',
+            'view_SOH': '%',
+            'view_SOC': '%',
+        }
+
+        icons = {
+            'total_packs_num': 'mdi:database',
+            'total_full_capacity': 'mdi:battery-high',
+            'total_remain_capacity': 'mdi:battery-clock',
+            'total_current': 'mdi:current-dc',
+            'total_SOC': 'mdi:battery-70',
+            'total_voltage': 'mdi:sine-wave',
+            'total_power': 'mdi:battery-charging',
+            'total_SOH': 'mdi:battery-plus-variant',
+            'total_energy_charged': 'mdi:battery-positive',
+            'total_energy_discharged': 'mdi:battery-negative',
+            'total_cell_voltage_max': 'mdi:align-vertical-top',
+            'total_cell_voltage_min': 'mdi:align-vertical-bottom',
+            'total_cell_voltage_diff': 'mdi:format-align-middle',
+            'view_num_cells': 'mdi:database',
+            'cell_voltages': 'mdi:sine-wave',
+            'cell_voltage_max': 'mdi:align-vertical-top',
+            'cell_voltage_min': 'mdi:align-vertical-bottom',
+            'cell_voltage_max_index': 'mdi:database',
+            'cell_voltage_min_index': 'mdi:database',
+            'cell_voltage_diff': 'mdi:format-align-middle',
+            'view_num_temps': 'mdi:database',
+            'temperatures': 'mdi:thermometer',
+            'view_current': 'mdi:current-dc',
+            'view_voltage': 'mdi:sine-wave',
+            'view_remain_capacity': 'mdi:battery-clock',
+            'view_full_capacity': 'mdi:battery-high',
+            'view_cycle_number': 'mdi:battery-sync',
+            'view_design_capacity': 'mdi:battery-high',
+            'view_power': 'mdi:battery-charging',
+            'view_energy_charged': 'mdi:battery-positive',
+            'view_energy_discharged': 'mdi:battery-negative',
+            'view_SOH': 'mdi:battery-plus-variant',
+            'view_SOC': 'mdi:battery-70',
+            'random_number': 'mdi:battery-70',
+        }
+
+        deviceclasses = {
+            'total_packs_num': 'null',
+            'total_full_capacity': 'null',
+            'total_remain_capacity': 'null',
+            'total_current': 'current',
+            'total_SOC': 'battery',
+            'total_voltage': 'voltage',
+            'total_power': 'power',
+            'total_SOH': 'null',
+            'total_energy_charged': 'energy',
+            'total_energy_discharged': 'energy',
+            'total_cell_voltage_max': 'voltage',
+            'total_cell_voltage_min': 'voltage',
+            'total_cell_voltage_diff': 'voltage',
+            'cell_voltages': 'voltage',
+            'cell_voltage_max': 'voltage',
+            'cell_voltage_min': 'voltage',
+            'cell_voltage_max_index': 'null',
+            'cell_voltage_min_index': 'null',
+            'cell_voltage_diff': 'voltage',
+            'temperatures': 'temperature',
+            'view_num_cells': 'null',
+            'view_num_temps': 'null',
+            'view_current': 'current',
+            'view_voltage': 'voltage',
+            'view_remain_capacity': 'null',
+            'view_full_capacity': 'null',
+            'view_cycle_number': 'null',
+            'view_design_capacity': 'null',
+            'view_energy_charged': 'energy',
+            'view_energy_discharged': 'energy',
+            'view_power': 'power',
+            'view_energy_charged': 'energy',
+            'view_energy_discharged': 'energy',
+            'view_SOH': 'null',
+            'view_SOC': 'null',
+            'random_number': 'null',
+        }
+
+        stateclasses = {
+            'total_packs_num': 'measurement',
+            'total_full_capacity': 'measurement',
+            'total_remain_capacity': 'measurement',
+            'total_current': 'measurement',
+            'total_SOC': 'measurement',
+            'total_voltage': 'measurement',
+            'total_power': 'measurement',
+            'total_SOH': 'measurement',
+            'total_energy_charged': 'total',
+            'total_energy_discharged': 'total',
+            'total_cell_voltage_max': 'measurement',
+            'total_cell_voltage_min': 'measurement',
+            'total_cell_voltage_diff': 'measurement',
+            'view_num_cells': 'measurement',
+            'cell_voltages': 'measurement',
+            'cell_voltage_max': 'measurement',
+            'cell_voltage_min': 'measurement',
+            'cell_voltage_max_index': 'measurement',
+            'cell_voltage_min_index': 'measurement',
+            'cell_voltage_diff': 'measurement',
+            'view_num_temps': 'measurement',
+            'temperatures': 'measurement',
+            'view_current': 'measurement',
+            'view_voltage': 'measurement',
+            'view_remain_capacity': 'measurement',
+            'view_full_capacity': 'measurement',
+            'view_cycle_number': 'measurement',
+            'view_design_capacity': 'measurement',
+            'view_power': 'measurement',
+            'view_energy_charged': 'total',
+            'view_energy_discharged': 'total',
+            'view_SOH': 'measurement',
+            'view_SOC': 'measurement',
+            'random_number': 'measurement',
+        }
+
+
+        while True:
+            analog_data = self.get_analog_data(pack_number)
+            if analog_data is not None:
+                break  # got a valid value, break the loop
+
+        total_packs_num = len(analog_data)
+
+        if total_packs_num < 1:
+            self.logger.error("No packs found")
+            return None
+
+        self.ha_comm.publish_sensor_state(total_packs_num, 'packs', "total_packs_num")
+        self.ha_comm.publish_sensor_discovery("total_packs_num", "packs", icons['total_packs_num'], deviceclasses['total_packs_num'], stateclasses['total_packs_num'])
+
+        total_full_capacity = round(sum(d.get('view_full_capacity', 0) for d in analog_data),2)
+        self.ha_comm.publish_sensor_state(total_full_capacity, 'Ah', "total_full_capacity")
+        self.ha_comm.publish_sensor_discovery("total_full_capacity", "Ah", icons['total_full_capacity'], deviceclasses['total_full_capacity'], stateclasses['total_full_capacity'])
+
+        total_remain_capacity = round(sum(d.get('view_remain_capacity', 0) for d in analog_data),2)
+        self.ha_comm.publish_sensor_state(total_remain_capacity, 'Ah', "total_remain_capacity")
+        self.ha_comm.publish_sensor_discovery("total_remain_capacity", "Ah", icons['total_remain_capacity'], deviceclasses['total_remain_capacity'], stateclasses['total_remain_capacity'])
+
+        total_current = round(sum(d.get('view_current', 0) for d in analog_data),2)
+        self.ha_comm.publish_sensor_state(total_current, 'A', "total_current")
+        self.ha_comm.publish_sensor_discovery("total_current", "A", icons['total_current'], deviceclasses['total_current'], stateclasses['total_current'])
+
+        total_soc = round(total_remain_capacity / total_full_capacity * 100, 1) if total_full_capacity > 0 else 0.0
+        self.ha_comm.publish_sensor_state(total_soc, '%', "total_SOC")
+        self.ha_comm.publish_sensor_discovery("total_SOC", "%", icons['total_SOC'], deviceclasses['total_SOC'], stateclasses['total_SOC'])
+
+        total_soh = round(sum(d.get('view_SOH', 0) for d in analog_data) / total_packs_num, 1)
+        self.ha_comm.publish_sensor_state(total_soh, '%', "total_SOH")
+        self.ha_comm.publish_sensor_discovery("total_SOH", "%", icons['total_SOH'], deviceclasses['total_SOH'], stateclasses['total_SOH'])
+
+        total_voltage = round(sum(d.get('view_voltage', 0) for d in analog_data) / total_packs_num, 2)
+        self.ha_comm.publish_sensor_state(total_voltage, 'V', "total_voltage")
+        self.ha_comm.publish_sensor_discovery("total_voltage", "V", icons['total_voltage'], deviceclasses['total_voltage'], stateclasses['total_voltage'])
+
+        total_power = round(sum(d.get('view_power', 0) for d in analog_data),1)
+        self.ha_comm.publish_sensor_state(total_power, 'kW', "total_power")
+        self.ha_comm.publish_sensor_discovery("total_power", "kW", icons['total_power'], deviceclasses['total_power'], stateclasses['total_power'])
+
+        # 使用累积能量计算
+        total_energy_charged, total_energy_discharged = self.calculate_cumulative_energy(total_power)
+        self.ha_comm.publish_sensor_state(total_energy_charged, 'Wh', "total_energy_charged")
+        self.ha_comm.publish_sensor_discovery("total_energy_charged", "Wh", icons['total_energy_charged'], deviceclasses['total_energy_charged'], stateclasses['total_energy_charged'])
+
+        self.ha_comm.publish_sensor_state(total_energy_discharged, 'Wh', "total_energy_discharged")
+        self.ha_comm.publish_sensor_discovery("total_energy_discharged", "Wh", icons['total_energy_discharged'], deviceclasses['total_energy_discharged'], stateclasses['total_energy_discharged'])
+
+        # Extract all cell_voltages lists and flatten them into a single list
+        all_cell_voltages = [voltage for d in analog_data for voltage in d.get('cell_voltages', [])]
+
+        # Find the maximum and min value from the flattened list
+        total_cell_voltage_max = max(all_cell_voltages, default=None)
+        self.ha_comm.publish_sensor_state(total_cell_voltage_max, 'mV', "total_cell_voltage_max")
+        self.ha_comm.publish_sensor_discovery("total_cell_voltage_max", "mV", icons['total_cell_voltage_max'], deviceclasses['total_cell_voltage_max'], stateclasses['total_cell_voltage_max'])
+
+        total_cell_voltage_min = min(all_cell_voltages, default=None)
+        self.ha_comm.publish_sensor_state(total_cell_voltage_min, 'mV', "total_cell_voltage_min")
+        self.ha_comm.publish_sensor_discovery("total_cell_voltage_min", "mV", icons['total_cell_voltage_min'], deviceclasses['total_cell_voltage_min'], stateclasses['total_cell_voltage_min'])
+
+        total_cell_voltage_diff = total_cell_voltage_max - total_cell_voltage_min
+        self.ha_comm.publish_sensor_state(total_cell_voltage_diff, 'mV', "total_cell_voltage_diff")
+        self.ha_comm.publish_sensor_discovery("total_cell_voltage_diff", "mV", icons['total_cell_voltage_diff'], deviceclasses['total_cell_voltage_diff'], stateclasses['total_cell_voltage_diff'])
+
+
+        if self.if_random:
+            import random
+            random_number = random.randint(1, 100)
+            self.ha_comm.publish_sensor_state(random_number, 'R', "random_number")
+            self.ha_comm.publish_sensor_discovery("random_number", "R", icons['random_number'], deviceclasses['random_number'], stateclasses['random_number'])
+
+
+        pack_i = 0
+
+        for pack in analog_data:
+            pack_i = pack_i + 1
+            for key, value in pack.items():
+                unit = units.get(key, '')
+                icon = icons.get(key, '')
+                deviceclass = deviceclasses.get(key, '')
+                stateclass = stateclasses.get(key, '')
+
+                if key == 'cell_voltages':
+                    cell_i = 0
+                    for cell_voltage in value:
+                        cell_i = cell_i + 1
+                        self.ha_comm.publish_sensor_state(cell_voltage, unit, f"pack_{pack_i:02}_cell_voltage_{cell_i:02}")
+                        self.ha_comm.publish_sensor_discovery(f"pack_{pack_i:02}_cell_voltage_{cell_i:02}", unit, icon,deviceclass,stateclass)
+                        
+                elif key == 'temperatures':
+                    temperature_i = 0
+                    for temperature in value:
+                        temperature_i = temperature_i + 1
+                        self.ha_comm.publish_sensor_state(temperature, unit, f"pack_{pack_i:02}_temperature_{temperature_i:02}")
+                        self.ha_comm.publish_sensor_discovery(f"pack_{pack_i:02}_temperature_{temperature_i:02}", unit, icon,deviceclass,stateclass)
+                        
+                else:
+                    self.ha_comm.publish_sensor_state(value, unit, f"pack_{pack_i:02}_{key}")
+                    self.ha_comm.publish_sensor_discovery(f"pack_{pack_i:02}_{key}", unit, icon,deviceclass,stateclass)
+
+
+    def publish_warning_data_mqtt(self, pack_number=None):
+
+        while True:
+            warn_data = self.get_warning_data(pack_number)
+            if warn_data is not None:
+                break  # got a valid value, break the loop
+
+        total_packs_num = len(warn_data)
+
+        if total_packs_num < 1:
+            self.logger.error("No packs found")
+            return None
+
+        pack_i = 0
+
+        for pack in warn_data:
+            pack_i = pack_i + 1
+            self.logger.debug(f"pack_{pack_i:02}: {pack_i}")
+            for key, value in pack.items():
+                unit = None
+                dclass = None
+                if key == 'cell_voltage_warnings':
+                    cell_i = 0
+                    icon = "mdi:battery-heart-variant"
+                    for cell_voltage_warning in value:
+                        cell_i = cell_i + 1
+                        self.ha_comm.publish_warn_state(cell_voltage_warning, f"pack_{pack_i:02}_cell_voltage_warning_{cell_i:02}")
+                        self.ha_comm.publish_warn_discovery(f"pack_{pack_i:02}_cell_voltage_warning_{cell_i:02}",icon)
+                elif key == 'temp_sensor_warnings':
+                    temp_i = 0
+                    icon = "mdi:battery-heart-variant"
+                    for temp_sensor_warning in value:
+                        temp_i = temp_i + 1
+                        self.ha_comm.publish_warn_state(temp_sensor_warning, f"pack_{pack_i:02}_temperature_warning_{temp_i:02}")
+                        self.ha_comm.publish_warn_discovery(f"pack_{pack_i:02}_temperature_warning_{temp_i:02}",icon)
+                elif key == 'protect_state_1':
+                    icon = "mdi:battery-alert"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                elif key == 'protect_state_2':
+                    icon = "mdi:battery-alert"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                elif key == 'instruction_state':
+                    icon = "mdi:battery-check"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                
+                elif key == 'fault_state':
+                    icon = "mdi:alert"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                elif key == 'warn_state_1':
+                    icon = "mdi:battery-heart-variant"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                elif key == 'warn_state_2':
+                    icon = "mdi:battery-heart-variant"
+                    for sub_key, sub_value in value.items():
+                        self.ha_comm.publish_binary_sensor_state(sub_value, f"pack_{pack_i:02}_{sub_key}")
+                        self.ha_comm.publish_binary_sensor_discovery(f"pack_{pack_i:02}_{sub_key}",icon)
+                elif key in ('balancing_status_passive_1', 'balancing_status_passive_2', 'balancing_status_active_1', 'balancing_status_active_2'):
+                    icon = "mdi:scale-balance"
+                    self.ha_comm.publish_warn_state(value, f"pack_{pack_i:02}_{key}")
+                    self.ha_comm.publish_warn_discovery(f"pack_{pack_i:02}_{key}", icon)
+                elif key not in ['cell_number', 'temp_sensor_number', 'control_state', 'balancing_status_passive_1', 'balancing_status_passive_2', 'balancing_status_active_1', 'balancing_status_active_2']:
+                    icon = "mdi:battery-heart-variant"
+                    self.ha_comm.publish_warn_state(value, f"pack_{pack_i:02}_{key}")
+                    self.ha_comm.publish_warn_discovery(f"pack_{pack_i:02}_{key}",icon)
+
+
+
+
+
