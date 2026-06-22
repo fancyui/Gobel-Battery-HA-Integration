@@ -287,6 +287,6 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.error("Error stopping BMS background thread: %s", e)
         if self.bms_comm:
             try:
-                self.bms_comm.close()
+                self.bms_comm.disconnect()
             except Exception as e:
                 _LOGGER.error("Error closing BMS port: %s", e)
