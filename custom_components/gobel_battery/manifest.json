@@ -6,6 +6,7 @@
   ],
   "config_flow": true,
   "documentation": "https://github.com/fancyui/Gobel-Battery-HA-Integration",
+  "issue_tracker": "https://github.com/fancyui/Gobel-Battery-HA-Integration/issues",
   "requirements": [
     "pyserial>=3.5"
   ],
