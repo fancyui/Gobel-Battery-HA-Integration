@@ -226,9 +226,12 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from BMS."""
-        async with async_timeout.timeout(15):
+        # First fetch needs more time for pack discovery (up to 15s wait + processing)
+        timeout_seconds = 30 if not getattr(self, '_first_fetch_done', False) else 15
+        async with async_timeout.timeout(timeout_seconds):
             try:
                 data = await self.hass.async_add_executor_job(self._fetch_data_sync)
+                self._first_fetch_done = True
                 return data
             except Exception as err:
                 raise UpdateFailed(f"BMS communication error: {err}") from err
