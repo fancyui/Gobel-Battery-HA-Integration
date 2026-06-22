@@ -1,10 +1,14 @@
 {
   "domain": "gobel_battery",
   "name": "Gobel Battery Monitor",
-  "codeowners": ["@fancyui"],
+  "codeowners": [
+    "@fancyui"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/fancyui/Gobel-Battery-HA-Addon",
-  "requirements": ["pyserial>=3.5"],
-  "version": "2.0.0",
+  "requirements": [
+    "pyserial>=3.5"
+  ],
+  "version": "2.0.5",
   "iot_class": "local_polling"
 }
