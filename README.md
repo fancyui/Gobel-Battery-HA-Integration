@@ -26,6 +26,7 @@ Unlike the previous Add-on version, this integration **does not require an MQTT 
 ## Dashboard Example:
 
 ![image](https://www.gobelpower.com/images/github/dashboard-gobel-power-home-assistant-addon-1.webp)
+![image](img/screen-1.png)
 
 ---
 

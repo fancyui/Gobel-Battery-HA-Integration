@@ -22,6 +22,7 @@ Im Gegensatz zur vorherigen Add-on-Version **benötigt diese Integration keinen 
 ## Dashboard-Beispiel:
 
 ![image](https://www.gobelpower.com/images/github/dashboard-gobel-power-home-assistant-addon-1.webp)
+![image](../../img/screen-1.png)
 
 ---
 

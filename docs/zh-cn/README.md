@@ -22,6 +22,7 @@
 ## 仪表盘示例：
 
 ![image](https://www.gobelpower.com/images/github/dashboard-gobel-power-home-assistant-addon-1.webp)
+![image](../../img/screen-1.png)
 
 ---
 
