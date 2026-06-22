@@ -3,7 +3,7 @@ import logging
 from homeassistant.components.sensor import SensorEntity, SensorStateClass, SensorDeviceClass
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -82,11 +82,7 @@ async def async_setup_entry(
 ):
     """Set up the sensor platform from a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    entities = []
-
-    # Get the latest data
-    data = coordinator.data
-    analog_packs = data.get("analog", []) if data else []
+    initial_entities = []
 
     # 1. Register Overall Battery Bank Sensors
     overall_sensors = [
@@ -104,50 +100,77 @@ async def async_setup_entry(
     ]
 
     for key, name, unit, dev_class, state_class, icon in overall_sensors:
-        entities.append(GobelBatteryOverallSensor(coordinator, key, name, unit, dev_class, state_class, icon))
+        initial_entities.append(GobelBatteryOverallSensor(coordinator, key, name, unit, dev_class, state_class, icon))
 
-    # 2. Register Per-Pack Sensors
-    # If no packs were fetched yet, default to creating entities for pack 1 (so entities are visible)
-    packs_to_create = len(analog_packs) if len(analog_packs) > 0 else 1
+    # Track registered pack IDs
+    registered_packs = set()
 
-    for pack_idx in range(packs_to_create):
-        # We try to get cell and temp counts from actual data if available, otherwise default to 16 cells / 4 temps
-        num_cells = 16
-        num_temps = 4
+    @callback
+    def async_add_pack_sensors():
+        """Add sensors for newly discovered packs."""
+        data = coordinator.data
+        analog_packs = data.get("analog", []) if data else []
         
-        if pack_idx < len(analog_packs):
-            pack_data = analog_packs[pack_idx]
-            num_cells = len(pack_data.get("cell_voltages", []))
-            num_temps = len(pack_data.get("temperatures", []))
+        # Default to pack 0 if no packs are detected yet so entities are visible
+        if not analog_packs and not registered_packs:
+            pack_ids_to_add = [0]
+        else:
+            pack_ids_to_add = [p.get("pack_id", 0) for p in analog_packs if p.get("pack_id", 0) not in registered_packs]
 
-        # Add predefined metrics (SOC, SOH, Voltage, Current, Cycle Count, etc.)
-        for metric, meta in SENSOR_METADATA.items():
-            entities.append(
-                GobelBatteryPackSensor(
-                    coordinator,
-                    pack_idx,
-                    metric,
-                    meta["name"],
-                    meta["unit"],
-                    meta["device_class"],
-                    meta["state_class"],
-                    meta["icon"],
+        new_entities = []
+        for pack_id in pack_ids_to_add:
+            if pack_id in registered_packs:
+                continue
+                
+            num_cells = 16
+            num_temps = 4
+            
+            # Count cells and temps from matching pack data if available
+            pack_data = next((p for p in analog_packs if p.get("pack_id") == pack_id), None)
+            if pack_data:
+                num_cells = len(pack_data.get("cell_voltages", []))
+                num_temps = len(pack_data.get("temperatures", []))
+
+            # Add predefined metrics (SOC, SOH, Voltage, Current, Cycle Count, etc.)
+            for metric, meta in SENSOR_METADATA.items():
+                new_entities.append(
+                    GobelBatteryPackSensor(
+                        coordinator,
+                        pack_id,
+                        metric,
+                        meta["name"],
+                        meta["unit"],
+                        meta["device_class"],
+                        meta["state_class"],
+                        meta["icon"],
+                    )
                 )
-            )
 
-        # Add cell voltage sensors (Cell 01 Voltage ... Cell N Voltage)
-        for cell_idx in range(1, num_cells + 1):
-            entities.append(
-                GobelBatteryCellVoltageSensor(coordinator, pack_idx, cell_idx)
-            )
+            # Add cell voltage sensors (Cell 01 Voltage ... Cell N Voltage)
+            for cell_idx in range(1, num_cells + 1):
+                new_entities.append(
+                    GobelBatteryCellVoltageSensor(coordinator, pack_id, cell_idx)
+                )
 
-        # Add temperature sensors (Temperature 01 ... Temperature N)
-        for temp_idx in range(1, num_temps + 1):
-            entities.append(
-                GobelBatteryTemperatureSensor(coordinator, pack_idx, temp_idx)
-            )
+            # Add temperature sensors (Temperature 01 ... Temperature N)
+            for temp_idx in range(1, num_temps + 1):
+                new_entities.append(
+                    GobelBatteryTemperatureSensor(coordinator, pack_id, temp_idx)
+                )
+                
+            registered_packs.add(pack_id)
 
-    async_add_entities(entities, update_before_add=True)
+        if new_entities:
+            async_add_entities(new_entities, update_before_add=True)
+
+    # Register initial overall sensors + any initially detected packs
+    async_add_entities(initial_entities, update_before_add=True)
+    async_add_pack_sensors()
+
+    # Listen for future updates
+    entry.async_on_unload(
+        coordinator.async_add_listener(async_add_pack_sensors)
+    )
 
 class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
     """Sensor representing aggregate battery bank metrics."""
@@ -219,15 +242,15 @@ class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
 class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
     """Sensor representing a specific battery pack metric."""
 
-    def __init__(self, coordinator, pack_index, metric, name, unit, device_class, state_class, icon):
+    def __init__(self, coordinator, pack_id, metric, name, unit, device_class, state_class, icon):
         """Initialize pack sensor."""
         super().__init__(coordinator)
-        self.pack_index = pack_index
+        self.pack_id = pack_id
         self._metric = metric
-        display_pack = pack_index + (0 if coordinator.jk_display_index_start == "00" else 1)
+        display_pack = pack_id + (0 if coordinator.jk_display_index_start == "00" else 1)
         
         self._attr_name = f"{coordinator.device_name} Pack {display_pack:02d} {name}"
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_index}_{metric}"
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_id}_{metric}"
         self._attr_native_unit_of_measurement = unit
         self._attr_device_class = device_class
         self._attr_state_class = state_class
@@ -236,9 +259,9 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
     @property
     def device_info(self):
         """Return device info for individual pack child device."""
-        display_pack = self.pack_index + (0 if self.coordinator.jk_display_index_start == "00" else 1)
+        display_pack = self.pack_id + (0 if self.coordinator.jk_display_index_start == "00" else 1)
         return {
-            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_index}")},
+            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
             "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
             "manufacturer": "Gobel Power",
@@ -252,10 +275,11 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
         if not data:
             return None
         analog_packs = data.get("analog", [])
-        if self.pack_index >= len(analog_packs):
+        
+        # Find pack data matching self.pack_id
+        pack_data = next((p for p in analog_packs if p.get("pack_id") == self.pack_id), None)
+        if not pack_data:
             return None
-
-        pack_data = analog_packs[self.pack_index]
         
         # Map metric keys
         if self._metric == "voltage":
@@ -282,15 +306,15 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
 class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
     """Sensor representing voltage of a single cell inside a battery pack."""
 
-    def __init__(self, coordinator, pack_index, cell_index):
+    def __init__(self, coordinator, pack_id, cell_index):
         """Initialize cell voltage sensor."""
         super().__init__(coordinator)
-        self.pack_index = pack_index
+        self.pack_id = pack_id
         self.cell_index = cell_index
-        display_pack = pack_index + (0 if coordinator.jk_display_index_start == "00" else 1)
+        display_pack = pack_id + (0 if coordinator.jk_display_index_start == "00" else 1)
 
         self._attr_name = f"{coordinator.device_name} Pack {display_pack:02d} Cell {cell_index:02d} Voltage"
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_index}_cell_{cell_index}_voltage"
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_id}_cell_{cell_index}_voltage"
         self._attr_native_unit_of_measurement = "mV"
         self._attr_device_class = SensorDeviceClass.VOLTAGE
         self._attr_state_class = SensorStateClass.MEASUREMENT
@@ -299,9 +323,9 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
     @property
     def device_info(self):
         """Return device info for individual pack child device."""
-        display_pack = self.pack_index + (0 if self.coordinator.jk_display_index_start == "00" else 1)
+        display_pack = self.pack_id + (0 if self.coordinator.jk_display_index_start == "00" else 1)
         return {
-            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_index}")},
+            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
             "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
@@ -313,10 +337,11 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
         if not data:
             return None
         analog_packs = data.get("analog", [])
-        if self.pack_index >= len(analog_packs):
+        
+        pack_data = next((p for p in analog_packs if p.get("pack_id") == self.pack_id), None)
+        if not pack_data:
             return None
 
-        pack_data = analog_packs[self.pack_index]
         voltages = pack_data.get("cell_voltages", [])
         if self.cell_index - 1 < len(voltages):
             return voltages[self.cell_index - 1]
@@ -326,15 +351,15 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
 class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
     """Sensor representing temperature of a single probe inside a battery pack."""
 
-    def __init__(self, coordinator, pack_index, temp_index):
+    def __init__(self, coordinator, pack_id, temp_index):
         """Initialize temperature sensor."""
         super().__init__(coordinator)
-        self.pack_index = pack_index
+        self.pack_id = pack_id
         self.temp_index = temp_index
-        display_pack = pack_index + (0 if coordinator.jk_display_index_start == "00" else 1)
+        display_pack = pack_id + (0 if coordinator.jk_display_index_start == "00" else 1)
 
         self._attr_name = f"{coordinator.device_name} Pack {display_pack:02d} Temperature {temp_index:02d}"
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_index}_temp_{temp_index}"
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_pack_{pack_id}_temp_{temp_index}"
         self._attr_native_unit_of_measurement = "°C"
         self._attr_device_class = SensorDeviceClass.TEMPERATURE
         self._attr_state_class = SensorStateClass.MEASUREMENT
@@ -343,9 +368,9 @@ class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
     @property
     def device_info(self):
         """Return device info for individual pack child device."""
-        display_pack = self.pack_index + (0 if self.coordinator.jk_display_index_start == "00" else 1)
+        display_pack = self.pack_id + (0 if self.coordinator.jk_display_index_start == "00" else 1)
         return {
-            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_index}")},
+            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
             "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
@@ -357,10 +382,11 @@ class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
         if not data:
             return None
         analog_packs = data.get("analog", [])
-        if self.pack_index >= len(analog_packs):
+        
+        pack_data = next((p for p in analog_packs if p.get("pack_id") == self.pack_id), None)
+        if not pack_data:
             return None
 
-        pack_data = analog_packs[self.pack_index]
         temps = pack_data.get("temperatures", [])
         if self.temp_index - 1 < len(temps):
             return temps[self.temp_index - 1]

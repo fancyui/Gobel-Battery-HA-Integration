@@ -804,10 +804,18 @@ class JKBMS485:
         import time
         current_time = time.time()
 
-        # Wait up to 10 seconds at startup (if caches are empty) to let background thread populate data
+        # Wait up to 10 seconds at startup (if caches are empty) to let background thread populate data.
+        # To avoid returning immediately when the very first frame arrives (leaving other packs undiscovered at first poll),
+        # we wait at least 3.5 seconds if we have just started, to collect as many packs as possible.
         start_wait = current_time
-        while not self.dynamic_cache and (time.time() - start_wait < 10.0):
-            time.sleep(0.2)
+        while time.time() - start_wait < 10.0:
+            if not self.dynamic_cache:
+                time.sleep(0.2)
+                continue
+            if time.time() - start_wait < 3.5:
+                time.sleep(0.2)
+                continue
+            break
 
         dynamic_results = {}
         setup_results = {}

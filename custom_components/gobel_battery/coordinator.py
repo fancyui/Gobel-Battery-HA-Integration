@@ -195,15 +195,26 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     analog_pack = self.bms.get_analog_data(p)
                     warning_pack = self.bms.get_warning_data(p)
+                    p_id = p if p is not None else 0
                     if analog_pack:
                         if isinstance(analog_pack, list):
+                            for idx, item in enumerate(analog_pack):
+                                if "pack_id" not in item:
+                                    item["pack_id"] = item.get("pack_index", idx)
                             analog_data.extend(analog_pack)
                         else:
+                            if "pack_id" not in analog_pack:
+                                analog_pack["pack_id"] = analog_pack.get("pack_index", p_id)
                             analog_data.append(analog_pack)
                     if warning_pack:
                         if isinstance(warning_pack, list):
+                            for idx, item in enumerate(warning_pack):
+                                if "pack_id" not in item:
+                                    item["pack_id"] = item.get("pack_index", idx)
                             warning_data.extend(warning_pack)
                         else:
+                            if "pack_id" not in warning_pack:
+                                warning_pack["pack_id"] = warning_pack.get("pack_index", p_id)
                             warning_data.append(warning_pack)
                 except Exception as ex:
                     _LOGGER.error("Error polling pack %s: %s", p, ex)
