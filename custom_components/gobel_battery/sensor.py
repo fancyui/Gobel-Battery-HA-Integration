@@ -6,7 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, BMS_TYPE_JK_PB
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,6 +133,10 @@ async def async_setup_entry(
 
             # Add predefined metrics (SOC, SOH, Voltage, Current, Cycle Count, etc.)
             for metric, meta in SENSOR_METADATA.items():
+                # Only JK BMS supports balance current telemetry
+                if metric == "balance_current" and coordinator.bms_type != BMS_TYPE_JK_PB:
+                    continue
+                    
                 new_entities.append(
                     GobelBatteryPackSensor(
                         coordinator,
@@ -195,6 +199,16 @@ class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
             "manufacturer": "Gobel Power",
             "model": f"{self.coordinator.bms_type} Bank",
         }
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        return len(data.get("analog", [])) > 0
 
     @property
     def native_value(self):
@@ -269,6 +283,17 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
+
+    @property
     def native_value(self):
         """Return value of pack metric."""
         data = self.coordinator.data
@@ -331,6 +356,17 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
+
+    @property
     def native_value(self):
         """Return cell voltage."""
         data = self.coordinator.data
@@ -374,6 +410,17 @@ class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
             "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
 
     @property
     def native_value(self):
