@@ -4,6 +4,14 @@ description:
 
 # Changelog
 
+## [2.0.9] - 2026-06-22
+### Fixed
+-   [Integration] Fixed an issue where the integration would not automatically reconnect after a serial or network disconnection.
+-   [JKBMS] Added a watchdog timer to force a connection reset if no valid telemetry frames are received for 15 seconds.
+-   [PACE/TDT] Enhanced underlying communication handler to immediately discard dead connections upon read exceptions and reconnect on the next polling cycle.
+
+---------------
+
 ## [2.0.8] - 2026-06-22
 ### Fixed
 - Fixed `AttributeError: 'BMSCommunication' object has no attribute 'close'` during integration unload.
