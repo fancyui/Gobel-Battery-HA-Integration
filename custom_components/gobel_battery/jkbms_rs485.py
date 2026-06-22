@@ -171,11 +171,14 @@ class JKBMS485:
         """
         self.logger.info("JK BMS background listener thread started")
         buffer = b''
+        last_data_time = time.time()
+        
         while self.running:
             try:
                 # Read raw passive data
                 raw_data = self.bms_comm.receive_jkbms_passive(read_timeout=1.0)
                 if raw_data:
+                    last_data_time = time.time()
                     # Append new data to sliding buffer
                     buffer += raw_data
                     
@@ -218,7 +221,17 @@ class JKBMS485:
                             buffer = buffer[2:]
                 else:
                     # No data received, sleep a bit to prevent high CPU usage
-                    time.sleep(0.05)
+                    if time.time() - last_data_time > 15.0:
+                        self.logger.warning("No data received for 15s, forcing connection reset...")
+                        self.bms_comm.disconnect()
+                        time.sleep(1.0)
+                        if self.bms_comm.connect():
+                            self.logger.info("Reconnected successfully after timeout")
+                        else:
+                            self.logger.error("Failed to reconnect after timeout")
+                        last_data_time = time.time()
+                    else:
+                        time.sleep(0.05)
             except Exception as e:
                 self.logger.error(f"Error in background listener thread: {e}", exc_info=True)
                 time.sleep(1.0)
