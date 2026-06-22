@@ -5,6 +5,22 @@ description:
 # Changelog
 
 
+## 2.0.1
+
+-   [JKBMS] Fix multi-pack discovery and entity registration.
+-   [JKBMS] Implement dynamic entity registration and unique physical `pack_id` mapping to prevent pack swapping and register newly online packs on the fly.
+-   [JKBMS] Optimize startup passive listening wait window to ensure all parallel packs check in before completing the initial poll.
+
+---------------
+
+
+## 2.0.0
+
+-   Migrate Home Assistant Add-on to native custom integration.
+
+---------------
+
+
 ## 1.9.79
 
 -   [JKBMS] Add support for publishing average cell voltage (`cell_voltage_avg`), maximum voltage cell index (`cell_voltage_max_index`), and minimum voltage cell index (`cell_voltage_min_index`) to Home Assistant via MQTT.

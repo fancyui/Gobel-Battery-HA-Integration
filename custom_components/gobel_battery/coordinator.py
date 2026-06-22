@@ -195,15 +195,26 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     analog_pack = self.bms.get_analog_data(p)
                     warning_pack = self.bms.get_warning_data(p)
+                    p_id = p if p is not None else 0
                     if analog_pack:
                         if isinstance(analog_pack, list):
+                            for idx, item in enumerate(analog_pack):
+                                if "pack_id" not in item:
+                                    item["pack_id"] = item.get("pack_index", idx)
                             analog_data.extend(analog_pack)
                         else:
+                            if "pack_id" not in analog_pack:
+                                analog_pack["pack_id"] = analog_pack.get("pack_index", p_id)
                             analog_data.append(analog_pack)
                     if warning_pack:
                         if isinstance(warning_pack, list):
+                            for idx, item in enumerate(warning_pack):
+                                if "pack_id" not in item:
+                                    item["pack_id"] = item.get("pack_index", idx)
                             warning_data.extend(warning_pack)
                         else:
+                            if "pack_id" not in warning_pack:
+                                warning_pack["pack_id"] = warning_pack.get("pack_index", p_id)
                             warning_data.append(warning_pack)
                 except Exception as ex:
                     _LOGGER.error("Error polling pack %s: %s", p, ex)
@@ -215,9 +226,12 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Fetch data from BMS."""
-        async with async_timeout.timeout(15):
+        # First fetch needs more time for pack discovery (up to 15s wait + processing)
+        timeout_seconds = 30 if not getattr(self, '_first_fetch_done', False) else 15
+        async with async_timeout.timeout(timeout_seconds):
             try:
                 data = await self.hass.async_add_executor_job(self._fetch_data_sync)
+                self._first_fetch_done = True
                 return data
             except Exception as err:
                 raise UpdateFailed(f"BMS communication error: {err}") from err
