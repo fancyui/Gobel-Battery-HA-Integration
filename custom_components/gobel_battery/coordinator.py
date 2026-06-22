@@ -82,6 +82,10 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
         self.bms = None
         self.dummy_ha = DummyHAComm()
 
+        self.pack_cache = {}
+        self.pack_failures = {}
+        self.max_failures = 3
+
     def _setup_bms_sync(self):
         """Synchronous setup of the BMS communication and driver."""
         _LOGGER.info("Initializing BMS connection for: %s", self.device_name)
@@ -219,9 +223,46 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as ex:
                     _LOGGER.error("Error polling pack %s: %s", p, ex)
 
+        # Reconcile with cache to hold old data on occasional read failures
+        seen_analog_packs = {item.get("pack_id", i): item for i, item in enumerate(analog_data)}
+        seen_warning_packs = {item.get("pack_id", i): item for i, item in enumerate(warning_data)}
+        
+        final_analog_data = []
+        final_warning_data = []
+        
+        all_pack_ids = set(seen_analog_packs.keys()) | set(seen_warning_packs.keys()) | set(self.pack_cache.keys())
+        
+        for p_id in all_pack_ids:
+            if p_id in seen_analog_packs:
+                # Read successful
+                self.pack_failures[p_id] = 0
+                if p_id not in self.pack_cache:
+                    self.pack_cache[p_id] = {}
+                self.pack_cache[p_id]['analog'] = seen_analog_packs[p_id]
+                if p_id in seen_warning_packs:
+                    self.pack_cache[p_id]['warning'] = seen_warning_packs[p_id]
+                
+                final_analog_data.append(seen_analog_packs[p_id])
+                if p_id in seen_warning_packs:
+                    final_warning_data.append(seen_warning_packs[p_id])
+            else:
+                # Read failed
+                self.pack_failures[p_id] = self.pack_failures.get(p_id, 0) + 1
+                failures = self.pack_failures[p_id]
+                
+                if failures <= self.max_failures and p_id in self.pack_cache:
+                    _LOGGER.debug("Using cached data for pack %s (failure %s/%s)", p_id, failures, self.max_failures)
+                    if 'analog' in self.pack_cache[p_id]:
+                        final_analog_data.append(self.pack_cache[p_id]['analog'])
+                    if 'warning' in self.pack_cache[p_id]:
+                        final_warning_data.append(self.pack_cache[p_id]['warning'])
+                else:
+                    if failures == self.max_failures + 1:
+                        _LOGGER.warning("Pack %s data unavailable after %s consecutive failures", p_id, failures)
+
         return {
-            "analog": analog_data,
-            "warning": warning_data,
+            "analog": final_analog_data,
+            "warning": final_warning_data,
         }
 
     async def _async_update_data(self):

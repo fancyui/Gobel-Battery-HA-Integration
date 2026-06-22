@@ -197,6 +197,16 @@ class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        return len(data.get("analog", [])) > 0
+
+    @property
     def native_value(self):
         """Calculate and return the native value of the aggregate sensor."""
         data = self.coordinator.data
@@ -269,6 +279,17 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
+
+    @property
     def native_value(self):
         """Return value of pack metric."""
         data = self.coordinator.data
@@ -331,6 +352,17 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
+
+    @property
     def native_value(self):
         """Return cell voltage."""
         data = self.coordinator.data
@@ -374,6 +406,17 @@ class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
             "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        analog_packs = data.get("analog", [])
+        return any(p.get("pack_id") == self.pack_id for p in analog_packs)
 
     @property
     def native_value(self):

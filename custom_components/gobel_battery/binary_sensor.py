@@ -120,6 +120,17 @@ class GobelBatteryBinarySensor(CoordinatorEntity, BinarySensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        if not super().available:
+            return False
+        data = self.coordinator.data
+        if not data:
+            return False
+        warning_packs = data.get("warning", [])
+        return any(p.get("pack_id") == self.pack_id for p in warning_packs)
+
+    @property
     def is_on(self):
         """Return True if the binary sensor is active/triggered."""
         data = self.coordinator.data
