@@ -6,7 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, BMS_TYPE_JK_PB
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,6 +133,10 @@ async def async_setup_entry(
 
             # Add predefined metrics (SOC, SOH, Voltage, Current, Cycle Count, etc.)
             for metric, meta in SENSOR_METADATA.items():
+                # Only JK BMS supports balance current telemetry
+                if metric == "balance_current" and coordinator.bms_type != BMS_TYPE_JK_PB:
+                    continue
+                    
                 new_entities.append(
                     GobelBatteryPackSensor(
                         coordinator,
