@@ -5,6 +5,14 @@ description:
 # Changelog
 
 
+## 2.0.7
+
+-   [Integration] Implement robust read retry mechanism and data caching for battery packs to smooth out intermittent RS485/Serial communication timeouts or CRC errors.
+-   [Integration] Fix entities dropping to `unknown` state by ensuring they correctly transition to the standard `unavailable` state if communication with a battery pack completely drops or exceeds the retry limit.
+
+---------------
+
+
 ## 2.0.6
 
 -   [PACE/TDT] Fix active balancing status parsing incorrectly reporting values due to shifted byte offsets in RS232 and RS485 protocols.
