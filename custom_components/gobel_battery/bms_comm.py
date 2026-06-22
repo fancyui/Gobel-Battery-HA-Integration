@@ -75,6 +75,9 @@ class BMSCommunication:
             if isinstance(data, str):
                 data = data.encode()  # Convert string to bytes if necessary
 
+            if not self.bms_connection:
+                raise ValueError("No active connection")
+
             # Check if the connection is a socket (Ethernet)
             if hasattr(self.bms_connection, 'send'):
                 sent_bytes = self.bms_connection.send(data)
@@ -90,11 +93,15 @@ class BMSCommunication:
 
         except Exception as e:
             self.logger.error(f"Error sending data to BMS: {e}")
+            self.disconnect()
             self.connect()
             return False
 
     def receive_data(self, return_raw=False):
         try:
+            if not self.bms_connection:
+                raise ValueError("No active connection")
+
             # Check if the connection is a serial connection
             if hasattr(self.bms_connection, 'readline'):
                 if hasattr(self.bms_connection, 'read_until'):
@@ -132,6 +139,7 @@ class BMSCommunication:
                 self.logger.error(f"Raw data (hex): {raw_data.hex()}")
             else:
                 self.logger.warning(f"No data received from BMS: {e}")
+                self.disconnect()
             return None
 
     def _receive_tcp_modbus_response(self):
@@ -404,6 +412,7 @@ class BMSCommunication:
 
                 except Exception as e:
                     self.logger.warning(f"JK BMS receive error: {e}")
+                    self.disconnect()
                     idle_count += 1
 
                 if got_data and idle_count >= idle_timeout:
