@@ -4,6 +4,11 @@ description:
 
 # Changelog
 
+## [2.0.8] - 2026-06-22
+### Fixed
+- Fixed `AttributeError: 'BMSCommunication' object has no attribute 'close'` during integration unload.
+
+
 
 ## 2.0.7
 

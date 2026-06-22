@@ -5,10 +5,10 @@
     "@fancyui"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/fancyui/Gobel-Battery-HA-Addon",
+  "documentation": "https://github.com/fancyui/Gobel-Battery-HA-Integration",
   "requirements": [
     "pyserial>=3.5"
   ],
-  "version": "2.0.7",
+  "version": "2.0.8",
   "iot_class": "local_polling"
 }
