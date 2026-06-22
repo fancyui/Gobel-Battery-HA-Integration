@@ -5,6 +5,13 @@ description:
 # Changelog
 
 
+## 2.0.6
+
+-   [PACE/TDT] Fix active balancing status parsing incorrectly reporting values due to shifted byte offsets in RS232 and RS485 protocols.
+
+---------------
+
+
 ## 2.0.1
 
 -   [JKBMS] Fix multi-pack discovery and entity registration.
