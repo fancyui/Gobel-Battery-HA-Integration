@@ -4,6 +4,12 @@ description:
 
 # Changelog
 
+## [2.0.10] - 2026-06-24
+### Fixed
+-   [BMS] Fixed socket buffer truncation and telemetry protocol desynchronization over Ethernet/WiFi connections by implementing TCP stream buffering and reading until carriage return delimiter.
+
+---------------
+
 ## [2.0.9] - 2026-06-22
 ### Fixed
 -   [Integration] Fixed an issue where the integration would not automatically reconnect after a serial or network disconnection.
