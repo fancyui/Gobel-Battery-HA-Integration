@@ -351,9 +351,12 @@ class JKBMS485:
             result['power_kw'] = raw_p / 1000000.0  # mW → kW
 
         # ---- Current: int32le at offset 158 (mA) ----
+        # Power in the frame is unsigned. Mirror the current sign so discharge is negative.
         if 162 <= len(data):
             raw_c = struct.unpack_from('<i', data, 158)[0]
             result['current_a'] = raw_c / 1000.0  # mA → A
+            if 'power_kw' in result and result['current_a'] < 0:
+                result['power_kw'] = -abs(result['power_kw'])
 
         # ---- Battery temp sensors: int16le at 162, 164, 254, 256, 258 (/10 = °C) ----
         temps = {
