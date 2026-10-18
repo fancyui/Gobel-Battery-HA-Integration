@@ -5,6 +5,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import slugify
 
 from .const import DOMAIN, BMS_TYPE_JK_PB
 
@@ -184,6 +185,10 @@ class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._key = key
         self._attr_name = f"{coordinator.device_name} {name}"
+        # Home Assistant prefixes new entity IDs with the bank device name "<name> (Total)", which gave
+        # sensor.<name>_total_<name>_total_soc (#24). Keep sensor.<name>_total_soc, the ID the
+        # dashboard generator uses. Registered entities keep their entity ID.
+        self.entity_id = f"sensor.{slugify(self._attr_name)}"
         self._attr_unique_id = f"{coordinator.entry.entry_id}_total_{key}"
         self._attr_native_unit_of_measurement = unit
         self._attr_device_class = device_class
