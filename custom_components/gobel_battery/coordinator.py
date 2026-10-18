@@ -2,10 +2,10 @@
 import logging
 import asyncio
 from datetime import timedelta
-import async_timeout
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 
 from .const import (
     DOMAIN,
@@ -85,6 +85,35 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
         self.pack_cache = {}
         self.pack_failures = {}
         self.max_failures = 3
+
+    def bank_device_info(self):
+        """Device info of the bank device that groups the packs."""
+        return {
+            "identifiers": {(DOMAIN, f"{self.entry.entry_id}_total")},
+            "name": f"{self.device_name} (Total)",
+            "manufacturer": "Gobel Power",
+            "model": f"{self.bms_type} Bank",
+        }
+
+    @callback
+    def async_link_pack_device(self, pack_id):
+        """Register a pack device under the bank device.
+
+        DeviceInfo via_device is deprecated and stops working in Home Assistant 2027.8.
+        Setting via_device_id on the registry entry works on every supported version.
+        """
+        registry = dr.async_get(self.hass)
+        bank = registry.async_get_or_create(
+            config_entry_id=self.entry.entry_id, **self.bank_device_info()
+        )
+        display_pack = pack_id + (0 if self.jk_display_index_start == "00" else 1)
+        pack = registry.async_get_or_create(
+            config_entry_id=self.entry.entry_id,
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_pack_{pack_id}")},
+            name=f"{self.device_name} Pack {display_pack:02d}",
+        )
+        if pack.via_device_id != bank.id:
+            registry.async_update_device(pack.id, via_device_id=bank.id)
 
     def _setup_bms_sync(self):
         """Synchronous setup of the BMS communication and driver."""
@@ -269,7 +298,7 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
         """Fetch data from BMS."""
         # First fetch needs more time for pack discovery (up to 15s wait + processing)
         timeout_seconds = 30 if not getattr(self, '_first_fetch_done', False) else 15
-        async with async_timeout.timeout(timeout_seconds):
+        async with asyncio.timeout(timeout_seconds):
             try:
                 data = await self.hass.async_add_executor_job(self._fetch_data_sync)
                 self._first_fetch_done = True

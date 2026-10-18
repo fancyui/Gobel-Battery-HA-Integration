@@ -73,7 +73,8 @@ async def async_setup_entry(
         for pack_id in pack_ids_to_add:
             if pack_id in registered_packs:
                 continue
-                
+            coordinator.async_link_pack_device(pack_id)
+
             for sub_dict, sensors in BINARY_SENSORS_METADATA.items():
                 for key, (name, device_class) in sensors.items():
                     new_entities.append(
@@ -116,7 +117,6 @@ class GobelBatteryBinarySensor(CoordinatorEntity, BinarySensorEntity):
         return {
             "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
-            "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
 
     @property

@@ -121,7 +121,8 @@ async def async_setup_entry(
         for pack_id in pack_ids_to_add:
             if pack_id in registered_packs:
                 continue
-                
+            coordinator.async_link_pack_device(pack_id)
+
             num_cells = 16
             num_temps = 4
             
@@ -193,12 +194,7 @@ class GobelBatteryOverallSensor(CoordinatorEntity, SensorEntity):
     @property
     def device_info(self):
         """Return device info for overall bank device."""
-        return {
-            "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_total")},
-            "name": f"{self.coordinator.device_name} (Total)",
-            "manufacturer": "Gobel Power",
-            "model": f"{self.coordinator.bms_type} Bank",
-        }
+        return self.coordinator.bank_device_info()
 
     @property
     def available(self) -> bool:
@@ -277,7 +273,6 @@ class GobelBatteryPackSensor(CoordinatorEntity, SensorEntity):
         return {
             "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
-            "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
             "manufacturer": "Gobel Power",
             "model": self.coordinator.bms_type,
         }
@@ -352,7 +347,6 @@ class GobelBatteryCellVoltageSensor(CoordinatorEntity, SensorEntity):
         return {
             "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
-            "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
 
     @property
@@ -408,7 +402,6 @@ class GobelBatteryTemperatureSensor(CoordinatorEntity, SensorEntity):
         return {
             "identifiers": {(DOMAIN, f"{self.coordinator.entry.entry_id}_pack_{self.pack_id}")},
             "name": f"{self.coordinator.device_name} Pack {display_pack:02d}",
-            "via_device": (DOMAIN, f"{self.coordinator.entry.entry_id}_total"),
         }
 
     @property
