@@ -23,12 +23,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up Gobel Battery Monitor from a config entry."""
     coordinator = GobelBatteryUpdateCoordinator(hass, entry)
     
-    # Run the synchronous driver initialization
-    if not await coordinator.async_setup():
-        raise ConfigEntryNotReady(f"Failed to connect to BMS for {entry.title}")
+    try:
+        # Run the synchronous driver initialization
+        if not await coordinator.async_setup():
+            raise ConfigEntryNotReady(f"Failed to connect to BMS for {entry.title}")
 
-    # Fetch initial data so entities have state on startup
-    await coordinator.async_config_entry_first_refresh()
+        # Fetch initial data so entities have state on startup
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        # Home Assistant retries the setup with a new coordinator; close this socket and thread first.
+        await hass.async_add_executor_job(coordinator.shutdown)
+        raise
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator

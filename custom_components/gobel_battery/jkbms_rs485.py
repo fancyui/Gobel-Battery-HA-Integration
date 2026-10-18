@@ -222,13 +222,13 @@ class JKBMS485:
                 else:
                     # No data received, sleep a bit to prevent high CPU usage
                     if time.time() - last_data_time > 15.0:
-                        self.logger.warning("No data received for 15s, forcing connection reset...")
+                        self.bms_comm.log_problem(self.logger, logging.WARNING, "No data received for 15s, forcing connection reset...")
                         self.bms_comm.disconnect()
                         time.sleep(1.0)
                         if self.bms_comm.connect():
                             self.logger.info("Reconnected successfully after timeout")
                         else:
-                            self.logger.error("Failed to reconnect after timeout")
+                            self.bms_comm.log_problem(self.logger, logging.ERROR, "Failed to reconnect after timeout")
                         last_data_time = time.time()
                     else:
                         time.sleep(0.05)
@@ -894,7 +894,7 @@ class JKBMS485:
 
         dynamic_results, setup_results, static_results = self.get_all_frames_data()
         if not dynamic_results:
-            self.logger.warning("Failed to get dynamic data, retrying once...")
+            self.bms_comm.log_problem(self.logger, logging.WARNING, "Failed to get dynamic data, retrying once...")
             import time
             time.sleep(0.5)
             dyn2, set2, stat2 = self.get_all_frames_data()
@@ -902,7 +902,7 @@ class JKBMS485:
             setup_results.update(set2)
             static_results.update(stat2)
             if not dynamic_results:
-                self.logger.error("Failed to get dynamic data after retry")
+                self.bms_comm.log_problem(self.logger, logging.ERROR, "Failed to get dynamic data after retry")
                 return []
 
         pack_list = []
@@ -1086,7 +1086,7 @@ class JKBMS485:
 
         dynamic_results, setup_results, static_results = self.get_all_frames_data()
         if not dynamic_results:
-            self.logger.warning("Failed to get dynamic data, retrying once...")
+            self.bms_comm.log_problem(self.logger, logging.WARNING, "Failed to get dynamic data, retrying once...")
             import time
             time.sleep(0.5)
             dyn2, set2, stat2 = self.get_all_frames_data()
@@ -1094,7 +1094,7 @@ class JKBMS485:
             setup_results.update(set2)
             static_results.update(stat2)
             if not dynamic_results:
-                self.logger.error("Failed to get dynamic data after retry")
+                self.bms_comm.log_problem(self.logger, logging.ERROR, "Failed to get dynamic data after retry")
                 return []
 
         pack_list = []
@@ -1241,7 +1241,7 @@ class JKBMS485:
 
         dynamic_results, _, _ = self.get_all_frames_data()
         if not dynamic_results:
-            self.logger.warning("Failed to get warning data, retrying once...")
+            self.bms_comm.log_problem(self.logger, logging.WARNING, "Failed to get warning data, retrying once...")
             import time
             time.sleep(0.5)
             dynamic_results, _, _ = self.get_all_frames_data()

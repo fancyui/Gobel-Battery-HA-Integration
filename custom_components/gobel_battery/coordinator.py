@@ -1,6 +1,7 @@
 """DataUpdateCoordinator for the Gobel Battery Monitor integration."""
 import logging
 import asyncio
+import time
 from datetime import timedelta
 import async_timeout
 
@@ -85,6 +86,7 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
         self.pack_cache = {}
         self.pack_failures = {}
         self.max_failures = 3
+        self._last_reopen = 0
 
     def _setup_bms_sync(self):
         """Synchronous setup of the BMS communication and driver."""
@@ -226,6 +228,8 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
         # Reconcile with cache to hold old data on occasional read failures
         seen_analog_packs = {item.get("pack_id", i): item for i, item in enumerate(analog_data)}
         seen_warning_packs = {item.get("pack_id", i): item for i, item in enumerate(warning_data)}
+        if not seen_analog_packs:
+            self._reopen_link()
         
         final_analog_data = []
         final_warning_data = []
@@ -264,6 +268,24 @@ class GobelBatteryUpdateCoordinator(DataUpdateCoordinator):
             "analog": final_analog_data,
             "warning": final_warning_data,
         }
+
+    def _reopen_link(self):
+        """Open a new TCP session after a poll without data, at most every 15 s.
+
+        A dongle reboot or firmware update leaves the old socket open without data.
+        Serial ports keep their handle, and the JK listener thread reconnects on its own.
+        """
+        if not self.bms_comm or self.connection_type == "serial" or self.bms_type == BMS_TYPE_JK_PB:
+            return
+        now = time.monotonic()
+        if now - self._last_reopen < 15:
+            return
+        self._last_reopen = now
+        self.bms_comm.log_problem(_LOGGER, logging.WARNING, "No BMS data from %s, reconnecting", self.ip_address)
+        try:
+            self.bms_comm.reconnect()
+        except Exception as err:
+            _LOGGER.debug("Reconnect failed: %s", err)
 
     async def _async_update_data(self):
         """Fetch data from BMS."""

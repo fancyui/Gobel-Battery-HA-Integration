@@ -1,6 +1,7 @@
 import serial
 import socket
 import logging
+import threading
 
 class BMSCommunication:
     def __init__(self, interface='serial', serial_port=None, baud_rate=None, ethernet_ip=None, ethernet_port=None,buffer_size=1024,debug=0):
@@ -12,13 +13,39 @@ class BMSCommunication:
         self.buffer_size = buffer_size
         self.bms_connection = None
         self._tcp_buffer = b''
+        # True from the first connection problem until data arrives again
+        self._link_down = False
+        self._link_lock = threading.Lock()
 
         # Configure logging
         logging.basicConfig(level=logging.DEBUG if debug else logging.INFO,
                             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
 
+    def log_problem(self, logger, level, message, *args):
+        """Log the first connection problem of an outage at `level` and the repeats at debug.
+
+        A dead link fails every poll. One line when it breaks and one when data
+        arrives again (link_works) keep the log readable.
+        """
+        with self._link_lock:
+            first = not self._link_down
+            self._link_down = True
+        logger.log(level if first else logging.DEBUG, message, *args)
+
+    def link_works(self):
+        """Log once that data arrives again after a connection problem."""
+        with self._link_lock:
+            if not self._link_down:
+                return
+            self._link_down = False
+        peer = f"{self.ethernet_ip}:{self.ethernet_port}" if self.interface in ['ethernet', 'wifi'] else self.serial_port
+        self.logger.info("Receiving data from BMS %s again", peer)
+
     def connect(self):
+        if self.bms_connection:
+            # A second connect must not leave the old port open: one-client dongles refuse the new session.
+            self.disconnect()
         if self.interface == 'serial' and self.serial_port and self.baud_rate:
             try:
                 self.logger.info(f"Trying to connect BMS over {self.serial_port}:{self.baud_rate}")
@@ -28,19 +55,20 @@ class BMSCommunication:
 
                 return self.bms_connection
             except serial.SerialException as e:
-                self.logger.error(f"Serial connection error: {e}")
+                self.log_problem(self.logger, logging.ERROR, f"Serial connection error: {e}")
                 return None
         elif self.interface in ['ethernet', 'wifi'] and self.ethernet_ip and self.ethernet_port:
             try:
                 self.logger.info(f"Trying to connect BMS over {self.ethernet_ip}:{self.ethernet_port}")
                 self.bms_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.bms_connection.settimeout(3)
+                self.bms_connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.bms_connection.connect((self.ethernet_ip, self.ethernet_port))
                 self._tcp_buffer = b''
                 self.logger.info(f"Connected to BMS over Ethernet: {self.ethernet_ip}:{self.ethernet_port}")
                 return self.bms_connection
             except socket.error as e:
-                self.logger.error(f"Ethernet connection error: {e}")
+                self.log_problem(self.logger, logging.ERROR, f"Ethernet connection error: {e}")
                 return None
         else:
             self.logger.error("Invalid parameters or interface selection.")
@@ -66,10 +94,13 @@ class BMSCommunication:
             # Set connection to None after closing it.
             self.bms_connection = None
         else:
-            self.logger.warning("No active connection to disconnect.")
+            self.logger.debug("No active connection to disconnect.")
 
-
-
+    def reconnect(self):
+        """Drop a dead socket and open a new one. A dongle reboot leaves the old one open."""
+        self.disconnect()
+        self._tcp_buffer = b""
+        return bool(self.connect())
 
     def send_data(self, data):
         try:
@@ -77,8 +108,8 @@ class BMSCommunication:
             if isinstance(data, str):
                 data = data.encode()  # Convert string to bytes if necessary
 
-            if not self.bms_connection:
-                raise ValueError("No active connection")
+            if not self.bms_connection and not self.connect():
+                return False
 
             # Check if the connection is a socket (Ethernet)
             if hasattr(self.bms_connection, 'send'):
@@ -94,9 +125,8 @@ class BMSCommunication:
             return True
 
         except Exception as e:
-            self.logger.error(f"Error sending data to BMS: {e}")
-            self.disconnect()
-            self.connect()
+            self.log_problem(self.logger, logging.ERROR, f"Error sending data to BMS: {e}")
+            self.reconnect()
             return False
 
     def receive_data(self, return_raw=False):
@@ -110,6 +140,8 @@ class BMSCommunication:
                     raw_data = self.bms_connection.read_until(b'\r')
                 else:
                     raw_data = self.bms_connection.readline()
+                if raw_data:
+                    self.link_works()
                 if return_raw:
                     return raw_data
                 else:
@@ -120,6 +152,7 @@ class BMSCommunication:
                     # For raw data, use dedicated TCP Modbus receiving logic
                     raw_data = self._receive_tcp_modbus_response()
                     if raw_data:
+                        self.link_works()
                         self.logger.debug(f"Received raw data (hex): {raw_data.hex().upper()}")
                         return raw_data
                     else:
@@ -130,6 +163,7 @@ class BMSCommunication:
                     if not hasattr(self, '_tcp_buffer'):
                         self._tcp_buffer = b''
                     
+                    peer_closed = False
                     import time
                     start_time = time.time()
                     timeout = self.bms_connection.gettimeout() or 3.0
@@ -141,13 +175,22 @@ class BMSCommunication:
                             # Read chunks of data
                             chunk = self.bms_connection.recv(4096)
                             if not chunk:
+                                peer_closed = True
                                 break
                             self._tcp_buffer += chunk
                         except socket.timeout:
                             break
                         except Exception as e:
-                            self.logger.error(f"Error reading socket: {e}")
+                            self.log_problem(self.logger, logging.ERROR, f"Error reading socket: {e}")
+                            peer_closed = True
                             break
+
+                    if peer_closed:
+                        # recv() returned b'' or failed: the dongle closed the session.
+                        self.log_problem(self.logger, logging.WARNING, "BMS closed the TCP connection")
+                        self.disconnect()
+                        self._tcp_buffer = b""
+                        return None
                     
                     if b'\r' in self._tcp_buffer:
                         idx = self._tcp_buffer.index(b'\r')
@@ -156,6 +199,8 @@ class BMSCommunication:
                     else:
                         raw_data = self._tcp_buffer
                         self._tcp_buffer = b''
+                    if raw_data:
+                        self.link_works()
                     
                     received_data = raw_data.decode('ascii', errors='ignore').strip()
             else:
@@ -170,7 +215,7 @@ class BMSCommunication:
                 self.logger.error(f"Error receiving data from BMS: {e}. Raw data: {raw_data}")
                 self.logger.error(f"Raw data (hex): {raw_data.hex()}")
             else:
-                self.logger.warning(f"No data received from BMS: {e}")
+                self.log_problem(self.logger, logging.WARNING, f"No data received from BMS: {e}")
                 self.disconnect()
             return None
 
@@ -223,7 +268,7 @@ class BMSCommunication:
                     # Timeout is normal, continue trying
                     pass
                 except Exception as e:
-                    self.logger.warning(f"Error while receiving data: {e}")
+                    self.log_problem(self.logger, logging.WARNING, f"Error while receiving data: {e}")
 
                 attempt += 1
 
@@ -231,11 +276,11 @@ class BMSCommunication:
                 self.logger.debug(f"Received data, but it might be incomplete: {len(all_data)} bytes")
                 return all_data
             else:
-                self.logger.warning("No data received")
+                self.log_problem(self.logger, logging.WARNING, "No data received")
                 return None
 
         except Exception as e:
-            self.logger.error(f"Error receiving TCP Modbus response: {e}")
+            self.log_problem(self.logger, logging.ERROR, f"Error receiving TCP Modbus response: {e}")
             return None
 
     def flush(self):
@@ -351,7 +396,7 @@ class BMSCommunication:
                     idle_count += 1
 
                 except Exception as e:
-                    self.logger.warning(f"JK BMS receive error: {e}")
+                    self.log_problem(self.logger, logging.WARNING, f"JK BMS receive error: {e}")
                     idle_count += 1
 
                 # After getting data, allow a few idle cycles for trailing chunks
@@ -364,14 +409,15 @@ class BMSCommunication:
                 time.sleep(0.05)
 
             if all_data:
+                self.link_works()
                 self.logger.debug(f"JK BMS: Total received {len(all_data)} bytes")
                 return all_data
             else:
-                self.logger.warning("JK BMS: No data received")
+                self.log_problem(self.logger, logging.WARNING, "JK BMS: No data received")
                 return None
 
         except Exception as e:
-            self.logger.error(f"JK BMS receive error: {e}")
+            self.log_problem(self.logger, logging.ERROR, f"JK BMS receive error: {e}")
             return None
 
     def receive_jkbms_passive(self, read_timeout=2.0):
@@ -397,7 +443,7 @@ class BMSCommunication:
 
             while time.time() - start_time < read_timeout:
                 if not self.bms_connection:
-                    self.logger.warning("JK BMS: No connection, attempting reconnect...")
+                    self.log_problem(self.logger, logging.WARNING, "JK BMS: No connection, attempting reconnect...")
                     if not self.connect():
                         time.sleep(0.5)
                         continue
@@ -427,7 +473,7 @@ class BMSCommunication:
                             idle_count += 1
                         else:
                             # recv() returned b'' — server closed the TCP connection
-                            self.logger.warning("JK BMS: Connection closed by remote (recv=b''), reconnecting...")
+                            self.log_problem(self.logger, logging.WARNING, "JK BMS: Connection closed by remote (recv=b''), reconnecting...")
                             try:
                                 self.bms_connection.close()
                             except Exception:
@@ -437,14 +483,14 @@ class BMSCommunication:
                                 self.logger.info("JK BMS: Reconnected successfully")
                                 idle_count = 0
                             else:
-                                self.logger.error("JK BMS: Reconnect failed, aborting read")
+                                self.log_problem(self.logger, logging.ERROR, "JK BMS: Reconnect failed, aborting read")
                                 break
 
                 except _socket.timeout:
                     idle_count += 1
 
                 except Exception as e:
-                    self.logger.warning(f"JK BMS receive error: {e}")
+                    self.log_problem(self.logger, logging.WARNING, f"JK BMS receive error: {e}")
                     self.disconnect()
                     idle_count += 1
 
@@ -454,6 +500,7 @@ class BMSCommunication:
                 time.sleep(0.05)
 
             if all_data:
+                self.link_works()
                 self.logger.debug(f"JK BMS: Passively received {len(all_data)} bytes")
                 return all_data
             else:
@@ -461,6 +508,6 @@ class BMSCommunication:
                 return None
 
         except Exception as e:
-            self.logger.error(f"JK BMS passive receive error: {e}")
+            self.log_problem(self.logger, logging.ERROR, f"JK BMS passive receive error: {e}")
             return None
 
