@@ -1,5 +1,6 @@
 import struct
 import logging
+import time
 
 class PACEBMS232:
 
@@ -44,7 +45,14 @@ class PACEBMS232:
             # Check command success (CID1 = 46, RTN = 00)
             cid1 = response[5:7]
             rtn = response[7:9]
-            if cid1 != '46' or rtn != '00':
+            if cid1 != '46':
+                return None
+            # A dongle also forwards frames the BMS sends by itself; they carry 42 or 44 where RTN is.
+            if rtn == '42':
+                return 'analog'
+            if rtn == '44':
+                return 'warning'
+            if rtn != '00':
                 return None
                 
             # Extract LENID (3 characters starting at index 10)
@@ -191,7 +199,7 @@ class PACEBMS232:
             else:
                 return self.parse_warning_data(response)
         else:
-            self.logger.warning(f"Protocol Desync: Expected {expected_type} packet, but received {packet_type} packet. Salvaging...")
+            self.logger.debug(f"Expected {expected_type} packet, but received {packet_type} packet. Caching it.")
             try:
                 if packet_type == 'analog':
                     analog_data = self.parse_analog_data(response)
@@ -440,7 +448,7 @@ class PACEBMS232:
         # Debug: Print the fields to verify their contents
         self.logger.debug(f"fields: {fields}")
         # Check the command and response validity
-        if fields[2] != '46' or fields[3] != '00':
+        if fields[2] != '46' or fields[3] not in ('00', '42'):
             self.logger.error(f"Invalid command or response code: {fields[2]} {fields[3]}")
             return None
     
@@ -579,7 +587,7 @@ class PACEBMS232:
         # Debug: Print the fields to verify their contents
         self.logger.debug(f"fields: {fields}")
         # Check the command and response validity
-        if fields[2] != '46' or fields[3] != '00':
+        if fields[2] != '46' or fields[3] not in ('00', '42'):
             self.logger.error(f"Invalid command or response code: {fields[2]} {fields[3]}")
             return None
     
@@ -756,10 +764,14 @@ class PACEBMS232:
                 offset += 2
                 u_offset += 2
 
-            # 4. SOC (1 byte)
+            # 4. SOC (1 byte). Slave packs can send a byte above 100 here; use remain/full instead.
             if found_u - u_offset >= 1:
                 pack_soc = int(fields[offset], 16)
-                pack_data['view_SOC'] = round(float(pack_soc), 1)
+                full_cap = pack_data.get('view_full_capacity', 0) or 0
+                if pack_soc > 100 and full_cap > 0:
+                    pack_data['view_SOC'] = round(pack_remain_capacity / full_cap * 100, 1)
+                else:
+                    pack_data['view_SOC'] = round(float(pack_soc), 1)
                 offset += 1
                 u_offset += 1
             else:
@@ -778,10 +790,15 @@ class PACEBMS232:
                 offset += 4
                 u_offset += 4
 
-            # 7. SOH (1 byte)
+            # 7. SOH (1 byte). Slave packs can send 0 here; use full/design instead.
             if found_u - u_offset >= 1:
                 pack_soh = int(fields[offset], 16)
-                pack_data['view_SOH'] = round(float(pack_soh), 1)
+                design_cap = pack_data.get('view_design_capacity', 0) or 0
+                full_cap = pack_data.get('view_full_capacity', 0) or 0
+                if (pack_soh == 0 or pack_soh > 100) and design_cap > 0 and full_cap > 0:
+                    pack_data['view_SOH'] = round(full_cap / design_cap * 100, 1)
+                else:
+                    pack_data['view_SOH'] = round(float(pack_soh), 1)
                 offset += 1
                 u_offset += 1
             else:
@@ -817,7 +834,7 @@ class PACEBMS232:
         length_low_byte = data[10:12]
 
         # Check the command and response validity
-        if command != '46' or rtn != '00':
+        if command != '46' or rtn not in ('00', '44'):
             self.logger.error(f"Invalid command or response code: {command} {rtn}")
             return None
         
@@ -1455,16 +1472,25 @@ class PACEBMS232:
                 return None
             self.logger.debug(f"analog request sent")
     
-            # Receive response from BMS
+            # Receive response from BMS. Frames the BMS pushed by itself can come first:
+            # read on for up to 1.2 s, and keep a pushed analog frame as a fallback.
             self.logger.debug(f"Trying to receive analog data")
-            response = self.bms_comm.receive_data()
-            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
-            self.logger.debug(f"analog data recieved: {response}")
-            if response is None:
-                return None
-            
-            # Process and validate response
-            return self.process_incoming_response(response, 'analog')
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                response = self.bms_comm.receive_data(timeout=min(0.4, max(0.05, deadline - time.monotonic())))
+                self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+                if not response:
+                    if not self.bms_comm.bms_connection:
+                        break  # the dongle dropped the session; waiting longer gives nothing
+                    continue
+                parsed = self.process_incoming_response(response, 'analog')
+                if parsed:
+                    return parsed
+            if self.cached_analog_data is not None:
+                data = self.cached_analog_data
+                self.cached_analog_data = None
+                return data
+            return None
     
         except Exception as e:
             self.logger.error(f"An error occurred in get_analog_data: {e}")
@@ -1494,16 +1520,25 @@ class PACEBMS232:
                 return None
             self.logger.debug(f"warning request sent")
             
-            # Receive response from BMS
+            # Receive response from BMS. Frames the BMS pushed by itself can come first:
+            # read on for up to 1.2 s, and keep a pushed warning frame as a fallback.
             self.logger.debug(f"Trying to receive warning data")
-            response = self.bms_comm.receive_data()
-            self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
-            self.logger.debug(f"warning data recieved: {response}")
-            if response is None:
-                return None
-            
-            # Process and validate response
-            return self.process_incoming_response(response, 'warning')
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                response = self.bms_comm.receive_data(timeout=min(0.4, max(0.05, deadline - time.monotonic())))
+                self.logger.debug(f"Raw Recv: {response} (Hex: {response.encode('ascii', errors='ignore').hex().upper() if response is not None else ''})")
+                if not response:
+                    if not self.bms_comm.bms_connection:
+                        break  # the dongle dropped the session; waiting longer gives nothing
+                    continue
+                parsed = self.process_incoming_response(response, 'warning')
+                if parsed:
+                    return parsed
+            if self.cached_warning_data is not None:
+                data = self.cached_warning_data
+                self.cached_warning_data = None
+                return data
+            return None
     
         except Exception as e:
             self.logger.error(f"An error occurred in get_warning_data: {e}")

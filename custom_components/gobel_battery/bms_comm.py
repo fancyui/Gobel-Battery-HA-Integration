@@ -99,7 +99,7 @@ class BMSCommunication:
             self.connect()
             return False
 
-    def receive_data(self, return_raw=False):
+    def receive_data(self, return_raw=False, timeout=None):
         try:
             if not self.bms_connection:
                 raise ValueError("No active connection")
@@ -132,13 +132,22 @@ class BMSCommunication:
                     
                     import time
                     start_time = time.time()
-                    timeout = self.bms_connection.gettimeout() or 3.0
-                    
+                    socket_timeout = self.bms_connection.gettimeout()
+                    if timeout is None:
+                        timeout = socket_timeout or 3.0
+
                     while b'\r' not in self._tcp_buffer:
-                        if time.time() - start_time > timeout:
+                        remaining = timeout - (time.time() - start_time)
+                        if remaining <= 0:
                             break
                         try:
-                            # Read chunks of data
+                            # Read chunks of data. Until the reply starts, a short timeout from the caller
+                            # also limits each recv(). Once it has started, recv() waits with the socket's
+                            # own timeout, so a frame split over two TCP parts still arrives whole.
+                            if self._tcp_buffer:
+                                self.bms_connection.settimeout(socket_timeout)
+                            else:
+                                self.bms_connection.settimeout(min(remaining, socket_timeout or remaining))
                             chunk = self.bms_connection.recv(4096)
                             if not chunk:
                                 break
@@ -148,7 +157,8 @@ class BMSCommunication:
                         except Exception as e:
                             self.logger.error(f"Error reading socket: {e}")
                             break
-                    
+                    self.bms_connection.settimeout(socket_timeout)
+
                     if b'\r' in self._tcp_buffer:
                         idx = self._tcp_buffer.index(b'\r')
                         raw_data = self._tcp_buffer[:idx + 1]
